@@ -15,6 +15,7 @@ from app.config.loader import load_snapshot
 from app.config.models import ConfigSnapshot
 from app.core.logging import configure_logging
 from app.core.settings import Settings, get_settings
+from app.db.dsn import parse_database_url
 from app.upstream.auth import Authenticator
 from app.upstream.client import UpstreamClient
 
@@ -37,7 +38,16 @@ def create_app(
         application.state.settings = settings
         pool = None
         if snapshot is None:
-            pool = await asyncpg.create_pool(settings.database_url, min_size=1, max_size=5)
+            password = settings.database_password.get_secret_value() if settings.database_password else None
+            params = parse_database_url(settings.database_url, password)
+            try:
+                pool = await asyncpg.create_pool(min_size=1, max_size=5, **params.as_kwargs())
+            except Exception as exc:
+                logger.error(
+                    "database_connect_failed",
+                    extra={"fields": params.describe() | {"error": type(exc).__name__, "detail": str(exc)}},
+                )
+                raise
             async with pool.acquire() as conn:
                 application.state.snapshot = await load_snapshot(conn)
         else:

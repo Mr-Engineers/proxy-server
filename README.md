@@ -25,6 +25,14 @@ Bez uwierzytelniania agentów, sesji, audytu i pipeline'u decyzyjnego (kolejne k
 - LLM: `stream: true` → `400 stream_not_supported`.
 - Błędy upstreamu: `502 upstream_unavailable`, `504 upstream_timeout`, `502 upstream_response_too_large`; format `{"error": {"type", "code", "message"}}`.
 
+### Baza danych
+
+- `DATABASE_URL` — hasło może zawierać znaki specjalne bez kodowania (`@ # / ? %` itd.); dane logowania są oddzielane od hosta po ostatnim `@`. Poprawnie zakodowane (`%40`) też działa.
+- `DATABASE_PASSWORD` (opcjonalne) — surowe hasło, nadpisuje to z URL; dla przypadków niejednoznacznych (np. hasło zawierające `%41`).
+- Supabase z ECS: session pooler, użytkownik `postgres.<project_ref>`, port 5432.
+- Obsługiwany parametr URL: `sslmode`.
+- Błąd połączenia przy starcie → log `database_connect_failed` z hostem, portem, użytkownikiem i bazą (bez hasła).
+
 ### Logi
 
 JSON na stdout (CloudWatch na ECS), jedna linia na zdarzenie:

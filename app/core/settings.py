@@ -1,5 +1,6 @@
 from functools import lru_cache
 
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -13,6 +14,7 @@ class Settings(BaseSettings):
 
     app_env: str = "development"
     database_url: str = ""
+    database_password: SecretStr | None = None
     max_request_bytes: int = 1_048_576
     max_response_bytes: int = 10_485_760
     log_level: str = "INFO"
