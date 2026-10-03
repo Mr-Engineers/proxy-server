@@ -39,14 +39,17 @@ class UpstreamClient:
         headers: list[tuple[str, str]],
         body: bytes,
         request_id: str,
+        extra_headers: dict[str, str] | None = None,
     ) -> UpstreamResponse:
+        """`extra_headers` dokłada proxy (np. X-On-Behalf-Of) — po filtrze nagłówków agenta."""
         url = app.upstream_url + path + (f"?{query}" if query else "")
         forwarded = filter_request_headers(headers)
         content_type = next((value for name, value in forwarded if name.lower() == "content-type"), None)
         auth_headers = self._authenticator.headers_for(app, method, url, content_type, body)
-        overridden = {name.lower() for name in auth_headers} | {"x-request-id"}
+        proxy_headers = {**(extra_headers or {}), **auth_headers, "X-Request-Id": request_id}
+        overridden = {name.lower() for name in proxy_headers}
         outgoing = [(name, value) for name, value in forwarded if name.lower() not in overridden]
-        outgoing += list(auth_headers.items()) + [("X-Request-Id", request_id)]
+        outgoing += list(proxy_headers.items())
 
         request = self._http.build_request(
             method,

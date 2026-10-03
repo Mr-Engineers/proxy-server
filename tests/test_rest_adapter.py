@@ -1,141 +1,148 @@
 import httpx
 
-from app.core.settings import Settings
-from tests.conftest import WAREHOUSE
+from tests.conftest import AUTH, open_session, rows
 
 
-def test_forwards_method_path_query_and_body(make_client, recorder) -> None:
-    client = make_client()
-    response = client.post(
-        "/apps/warehouse/purchase-orders?dry_run=1&x=a%20b",
-        json={"sku": "PAP-A4-80", "quantity": 38},
+def test_requires_agent_key(client, upstreams) -> None:
+    response = client.get("/apps/warehouse/low-stock")
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "missing_agent_key"
+
+    response = client.get("/apps/warehouse/low-stock", headers={"Authorization": "Bearer ak_dev0001_wrong"})
+    assert response.status_code == 401
+    assert upstreams.requests == []
+
+
+def test_requires_valid_session(client, upstreams) -> None:
+    response = client.get("/apps/warehouse/low-stock", headers=AUTH)
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "session_required"
+
+    response = client.get("/apps/warehouse/low-stock", headers={**AUTH, "X-Session-Id": "ses_forged"})
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "invalid_session"
+    assert upstreams.requests == []
+
+
+def test_closed_session_is_rejected(client) -> None:
+    headers = open_session(client)
+    assert client.post(f"/v1/sessions/{headers['X-Session-Id']}/close", headers=AUTH).json()["status"] == "closed"
+    response = client.get("/apps/warehouse/low-stock", headers=headers)
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "session_closed"
+
+
+def test_forwards_and_injects_upstream_credentials(client, upstreams) -> None:
+    headers = open_session(client)
+    response = client.get(
+        "/apps/warehouse/low-stock",
+        headers={**headers, "Cookie": "session=abc", "X-On-Behalf-Of": "someone-else", "X-Api-Key": "agent-provided",
+                 "X-Custom": "dropped"},
     )
 
     assert response.status_code == 200
-    assert recorder.last.method == "POST"
-    assert str(recorder.last.url) == "http://warehouse:8000/purchase-orders?dry_run=1&x=a%20b"
-    assert recorder.last_json() == {"sku": "PAP-A4-80", "quantity": 38}
-
-
-def test_returns_upstream_status_and_body(make_client, recorder) -> None:
-    recorder.handler = lambda request: httpx.Response(404, json={"error": {"code": "unknown_sku"}})
-    response = make_client().get("/apps/warehouse/low-stock")
-
-    assert response.status_code == 404
-    assert response.json() == {"error": {"code": "unknown_sku"}}
-
-
-def test_injects_upstream_credentials_and_strips_agent_credentials(make_client, recorder) -> None:
-    make_client().get(
-        "/apps/warehouse/low-stock",
-        headers={
-            "Authorization": "Bearer ak_k7f3a2_agentsecret",
-            "X-Session-Id": "ses_1",
-            "Cookie": "session=abc",
-            "X-On-Behalf-Of": "someone-else",
-            "X-Api-Key": "agent-provided",
-            "X-Custom": "kept",
-        },
-    )
-
-    sent = recorder.last.headers
+    assert response.json()["items"][0]["sku"] == "PAP-A4-80"
+    assert response.headers["x-decision-id"].startswith("dec_")
+    sent = upstreams.last.headers
+    assert str(upstreams.last.url) == "http://warehouse:8000/low-stock"
     assert sent["x-api-key"] == "wh-secret"
+    assert sent["x-on-behalf-of"] == "purchasing-agent"
     assert "authorization" not in sent
     assert "x-session-id" not in sent
     assert "cookie" not in sent
-    assert "x-on-behalf-of" not in sent
-    assert sent["x-custom"] == "kept"
+    assert "x-custom" not in sent
 
 
-def test_strips_hop_by_hop_and_connection_listed_headers(make_client, recorder) -> None:
-    make_client().get(
-        "/apps/warehouse/low-stock",
-        headers={"Connection": "keep-alive, X-Internal", "X-Internal": "1", "Keep-Alive": "timeout=5"},
+def test_forwards_body_and_idempotency_key(client, upstreams) -> None:
+    headers = open_session(client)
+    client.get("/apps/warehouse/low-stock", headers=headers)
+    client.get("/apps/marketplace/search?sku=PAP-A4-80", headers=headers)
+    response = client.post(
+        "/apps/marketplace/orders",
+        json={"offer_id": "off_bm_pap", "quantity": 38, "expected_unit_price": {"amount": "118.00", "currency": "PLN"}},
+        headers={**headers, "Idempotency-Key": "key-1"},
     )
+    assert response.status_code == 201, response.text
+    order = upstreams.to("marketplace")[-1]
+    assert order.url.path == "/orders"
+    assert order.headers["idempotency-key"] == "key-1"
+    assert upstreams.last_json()["quantity"] == 38
 
-    sent = recorder.last.headers
-    assert "x-internal" not in sent
-    assert "keep-alive" not in sent
+
+def test_unknown_route_is_denied(client, upstreams) -> None:
+    headers = open_session(client)
+    response = client.post("/apps/warehouse/admin/scenarios/x/load", json={}, headers=headers)
+
+    assert response.status_code == 403
+    body = response.json()
+    assert body["status"] == "blocked"
+    assert body["decision_id"].startswith("dec_")
+    assert "reasons" not in body
+    assert upstreams.to("warehouse") == []
+    decision = rows("select tool, verdict, reasons from proxy.decisions where id = $1", body["decision_id"])[0]
+    assert decision["tool"] == "warehouse.<unmatched>"
+    assert decision["reasons"][0]["code"] == "unknown_route"
 
 
-def test_propagates_request_id(make_client, recorder) -> None:
-    response = make_client().get("/apps/warehouse/low-stock", headers={"X-Request-Id": "spoofed"})
+def test_unknown_app(client, upstreams) -> None:
+    response = client.get("/apps/unknown/anything", headers=open_session(client))
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "unknown_app"
 
+
+def test_llm_app_not_reachable_via_rest_route(client, upstreams) -> None:
+    response = client.post("/apps/bedrock/chat/completions", json={}, headers=open_session(client))
+    assert response.status_code == 404
+    assert upstreams.requests == []
+
+
+def test_rejects_dot_segments(client, upstreams) -> None:
+    response = client.get("/apps/warehouse/a/%2e%2e/admin", headers=open_session(client))
+    assert response.status_code == 400
+    assert upstreams.requests == []
+
+
+def test_propagates_request_id(client, upstreams) -> None:
+    response = client.get("/apps/warehouse/low-stock", headers={**open_session(client), "X-Request-Id": "spoofed"})
     request_id = response.headers["x-request-id"]
     assert request_id.startswith("req_")
-    assert recorder.last.headers["x-request-id"] == request_id
+    assert upstreams.last.headers["x-request-id"] == request_id
 
 
-def test_strips_set_cookie_from_upstream(make_client, recorder) -> None:
-    recorder.handler = lambda request: httpx.Response(
-        200, json={}, headers={"Set-Cookie": "sid=service-account", "X-Upstream": "1"}
-    )
-    response = make_client().get("/apps/warehouse/low-stock")
-
+def test_strips_set_cookie_from_upstream(client, upstreams) -> None:
+    upstreams.handler = lambda request: httpx.Response(200, json={}, headers={"Set-Cookie": "sid=x", "X-Upstream": "1"})
+    response = client.get("/apps/warehouse/low-stock", headers=open_session(client))
     assert "set-cookie" not in response.headers
     assert response.headers["x-upstream"] == "1"
 
 
-def test_unknown_app(make_client, recorder) -> None:
-    response = make_client().get("/apps/unknown/anything")
+def test_upstream_errors(client, upstreams) -> None:
+    headers = open_session(client)
 
-    assert response.status_code == 404
-    assert response.json()["error"]["code"] == "unknown_app"
-    assert recorder.requests == []
-
-
-def test_llm_app_not_reachable_via_rest_route(make_client, recorder) -> None:
-    response = make_client().post("/apps/bedrock/chat/completions", json={})
-
-    assert response.status_code == 404
-    assert recorder.requests == []
-
-
-def test_rejects_dot_segments(make_client, recorder) -> None:
-    response = make_client().get("/apps/warehouse/a/%2e%2e/admin")
-
-    assert response.status_code == 400
-    assert recorder.requests == []
-
-
-def test_upstream_timeout(make_client, recorder) -> None:
     def timeout(request: httpx.Request) -> httpx.Response:
         raise httpx.ReadTimeout("timeout", request=request)
 
-    recorder.handler = timeout
-    response = make_client().get("/apps/warehouse/low-stock")
-
+    upstreams.handler = timeout
+    response = client.get("/apps/warehouse/low-stock", headers=headers)
     assert response.status_code == 504
-    assert response.json()["error"] == {
-        "type": "upstream_error",
-        "code": "upstream_timeout",
-        "message": "Upstream warehouse did not respond in time",
-    }
+    assert response.json()["error"]["code"] == "upstream_timeout"
 
-
-def test_upstream_unavailable(make_client, recorder) -> None:
     def refused(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("refused", request=request)
 
-    recorder.handler = refused
-    response = make_client().get("/apps/warehouse/low-stock")
-
+    upstreams.handler = refused
+    response = client.get("/apps/warehouse/low-stock", headers=headers)
     assert response.status_code == 502
     assert response.json()["error"]["code"] == "upstream_unavailable"
+    statuses = [row["action_status"] for row in rows("select action_status from proxy.decisions order by created_at")]
+    assert statuses == ["upstream_error", "upstream_error"]
 
 
-def test_response_too_large(make_client, recorder) -> None:
-    recorder.handler = lambda request: httpx.Response(200, content=b"x" * 2048)
-    response = make_client(WAREHOUSE, settings=Settings(max_response_bytes=1024)).get("/apps/warehouse/low-stock")
+def test_size_limits(make_client, upstreams) -> None:
+    client = make_client(max_response_bytes=1024, max_request_bytes=64)
+    headers = open_session(client)
+    upstreams.handler = lambda request: httpx.Response(200, content=b"x" * 2048)
+    assert client.get("/apps/warehouse/low-stock", headers=headers).json()["error"]["code"] == "upstream_response_too_large"
 
-    assert response.status_code == 502
-    assert response.json()["error"]["code"] == "upstream_response_too_large"
-
-
-def test_request_too_large(make_client, recorder) -> None:
-    response = make_client(WAREHOUSE, settings=Settings(max_request_bytes=16)).post(
-        "/apps/warehouse/purchase-orders", content=b"x" * 64
-    )
-
+    response = client.post("/apps/warehouse/purchase-orders", content=b"x" * 128, headers=headers)
     assert response.status_code == 413
-    assert recorder.requests == []

@@ -1,0 +1,8 @@
+{
+  "purchasing-agent": {
+    "place_order": {
+      "allowed_countries": ["PL"],
+      "max_order_value": {"amount": "5000.00", "currency": "PLN"}
+    }
+  }
+}

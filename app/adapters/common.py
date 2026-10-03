@@ -47,7 +47,8 @@ def _log_exchange(
     settings = request.app.state.settings
     fields: dict[str, object] = {
         "request_id": request.state.request_id,
-        "session_id": request.headers.get("x-session-id"),
+        "session_id": getattr(request.state, "session_id", None),
+        "agent_id": getattr(request.state, "agent_id", None),
         "protocol": app.protocol.value,
         "app": app.id,
         "method": method,

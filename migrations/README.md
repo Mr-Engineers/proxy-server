@@ -7,6 +7,7 @@ Czysty SQL (PostgreSQL ≥ 13), uruchamiany w kolejności numerów. Działa na S
 | `0001_config.sql` | konfiguracja edytowana z UI: agenci, klucze, aplikacje, toole, uprawnienia, pakiety polityk, ustawienia; wersjonowanie i historia zmian |
 | `0002_runtime.sql` | stan działania: sesje, hopy (audyt), decyzje, approvale, rejestr wydatków |
 | `0003_aws_sigv4_auth.sql` | uwierzytelnianie upstreamu przez AWS SigV4 (Bedrock z rolą IAM) |
+| `0004_pipeline.sql` | role (RBAC), reguły UI, kwoty, redakcja, operatorzy, kolumny audytu w `decisions` (`chain`, `tool`, `args_redacted`, `action_status`), `rate_limited`, temporary grants |
 
 ## Uruchomienie
 
@@ -14,6 +15,7 @@ Czysty SQL (PostgreSQL ≥ 13), uruchamiany w kolejności numerów. Działa na S
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0001_config.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0002_runtime.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0003_aws_sigv4_auth.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0004_pipeline.sql
 ```
 
 ## Mechanizmy

@@ -1,0 +1,10 @@
+{
+  "place_order": {
+    "allowed_countries": {"type": "allowlist"},
+    "max_order_value": {"type": "max_money"},
+    "max_qty_ratio_pct": {"type": "max_number"},
+    "min_merchant_age_days": {"type": "min_number"},
+    "require_grounded_offer": {"type": "flag"},
+    "budget": {"type": "budget"}
+  }
+}

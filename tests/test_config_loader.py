@@ -1,13 +1,10 @@
 import asyncio
-import os
-from pathlib import Path
 
 import pytest
 
 from app.config.loader import ConfigError, build_snapshot, load_snapshot
 from app.config.models import AuthType, Protocol
 
-MIGRATIONS = sorted((Path(__file__).parent.parent / "migrations").glob("*.sql"))
 
 
 def _row(**overrides) -> dict:
@@ -65,35 +62,48 @@ def test_single_llm_app() -> None:
         build_snapshot(1, [llm, llm | {"id": "other"}], {})
 
 
-@pytest.mark.skipif(not os.environ.get("TEST_DATABASE_URL"), reason="TEST_DATABASE_URL not set")
-def test_loads_snapshot_from_postgres() -> None:
+def test_loads_full_snapshot_from_postgres(database) -> None:
     import asyncpg
 
-    async def scenario() -> None:
-        conn = await asyncpg.connect(os.environ["TEST_DATABASE_URL"])
+    from app.store.runtime import init_connection
+
+    async def scenario():
+        conn = await asyncpg.connect(database)
         try:
-            await conn.execute("drop schema if exists proxy cascade")
-            for migration in MIGRATIONS:
-                await conn.execute(migration.read_text())
-            await conn.execute(
-                """
-                insert into proxy.apps (id, name, protocol, upstream_url, auth_type, aws_region, aws_service)
-                values ('bedrock', 'Bedrock', 'llm', 'https://bedrock-runtime.eu-north-1.amazonaws.com/openai/v1',
-                        'aws_sigv4', 'eu-north-1', 'bedrock');
-                insert into proxy.apps (id, name, protocol, upstream_url, auth_type, auth_header, auth_secret_env)
-                values ('warehouse', 'Magazyn', 'rest', 'http://warehouse:8000', 'api_key_header', 'X-Api-Key',
-                        'WAREHOUSE_API_KEY');
-                insert into proxy.apps (id, name, protocol, upstream_url, enabled)
-                values ('disabled_app', 'Off', 'rest', 'http://off:8000', false);
-                """
-            )
-            snapshot = await load_snapshot(conn, {"WAREHOUSE_API_KEY": "secret"})
+            await init_connection(conn)
+            return await load_snapshot(conn, {"WAREHOUSE_API_KEY": "secret", "BEDROCK_API_KEY": "k"})
         finally:
-            await conn.execute("drop schema if exists proxy cascade")
             await conn.close()
 
-        assert snapshot.revision == 3
-        assert set(snapshot.apps) == {"bedrock", "warehouse"}
-        assert snapshot.llm.auth.aws_region == "eu-north-1"
+    snapshot = asyncio.run(scenario())
+    assert set(snapshot.apps) == {"bedrock", "warehouse", "marketplace"}
+    assert snapshot.apps["marketplace"].enrichment[1].params == {"merchant_id": "$.offer.merchant.id"}
+    agent = snapshot.agents["purchasing-agent"]
+    assert agent.permissions == {
+        "warehouse.list_low_stock", "warehouse.register_po", "marketplace.search_products", "marketplace.place_order"
+    }
+    assert "dev0001" in snapshot.keys
+    pack = snapshot.policy_packs["marketplace"]
+    assert pack.params_for("purchasing-agent", "place_order")["allowed_countries"] == ["PL"]
+    assert pack.params_for("other-agent", "place_order")["max_order_value_minor"] == 1_000_000
+    assert snapshot.settings.org_name == "Modus Demo"
+    assert snapshot.tool("marketplace.search_products").capture[0].key == "offer_id"
 
-    asyncio.run(scenario())
+
+def test_role_must_be_active_to_grant(database) -> None:
+    import asyncpg
+
+    async def scenario():
+        conn = await asyncpg.connect(database)
+        try:
+            await conn.execute("update proxy.roles set status = 'draft'")
+            return await load_snapshot(conn, {"WAREHOUSE_API_KEY": "secret", "BEDROCK_API_KEY": "k"})
+        finally:
+            await conn.close()
+
+    assert asyncio.run(scenario()).agents["purchasing-agent"].permissions == frozenset()
+
+
+def test_override_for_unknown_agent_fails() -> None:
+    with pytest.raises(ConfigError, match="unknown agent"):
+        build_snapshot(1, [], {}, overrides=[{"app_id": "marketplace", "agent_id": "ghost", "params": "{}"}])

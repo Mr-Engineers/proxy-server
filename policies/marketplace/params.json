@@ -1,0 +1,10 @@
+{
+  "place_order": {
+    "allowed_countries": ["AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR", "HU", "IE", "IT", "LV", "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK", "SI", "ES", "SE"],
+    "max_order_value": {"amount": "10000.00", "currency": "PLN"},
+    "max_qty_ratio_pct": 120,
+    "min_merchant_age_days": 180,
+    "require_grounded_offer": true,
+    "budget": [{"window": "24h", "amount": "20000.00", "currency": "PLN"}]
+  }
+}

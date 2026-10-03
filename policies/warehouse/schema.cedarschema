@@ -1,0 +1,23 @@
+entity Agent;
+entity Tool {
+  kind: String,
+};
+
+type RegisterPoParams = {
+  require_placed_order: Bool,
+  max_qty_ratio_pct: Long,
+};
+
+action "warehouse.register_po" appliesTo {
+  principal: Agent,
+  resource: Tool,
+  context: {
+    params: RegisterPoParams,
+    order_seen_in_session: Bool,
+    qty_ratio_pct: Long,
+    quantity: Long,
+    qty_needed: Long,
+    sku: String,
+    sku_needed: Bool,
+  },
+};

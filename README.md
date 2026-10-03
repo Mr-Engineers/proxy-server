@@ -2,95 +2,163 @@
 
 Security proxy — jedyny punkt wyjścia agenta. Ruch do LLM, aplikacji, MCP i innych agentów przechodzi przez proxy.
 
-Dokumentacja architektury: [`../docs`](../docs/README.md).
+Dokumentacja architektury: [`../docs`](../docs/README.md). Kontrakty UI: [`../docs/api`](../docs/api/README.md).
 
 ## Stan
 
-Krok 1 — przezroczyste proxy:
+Warstwa deterministyczna i HITL gotowe pod pierwszy use case (agent zakupowy). ML: tylko punkt wpięcia (`MlScorer`), modeli brak — decyduje agregator v0 na regułach.
 
-| Endpoint | Upstream |
+| Obszar | Co działa |
 |---|---|
-| `POST /v1/chat/completions` | aplikacja z `protocol = 'llm'` (Amazon Bedrock, OpenAI-compatible) |
-| `GET/POST/PUT/PATCH/DELETE /apps/{app_id}/{path}` | aplikacja z `protocol = 'rest'` → `upstream_url + /{path}` |
-| `GET /health` | — |
+| Auth agenta (D6) | `Authorization: Bearer ak_<key_id>_<secret>`, w bazie tylko SHA-256; `status` agenta `active` / `disabled` / `revoked` |
+| Sesje (D7) | `POST /v1/sessions`, `X-Session-Id` przypięte do agenta, `POST /v1/sessions/{id}/close` |
+| Katalog akcji (D3) | `proxy.tools`: trasa → `app.tool`; nieznana trasa = DENY; parametry ścieżki `{id}`; `args` / `capture` / `scan` przez JSONPath |
+| Pipeline (S10) | walidacja `input_schema` → kwoty → RBAC → enrichment → Cedar + reguły UI → sygnały ML → agregator v0 → `decisions` |
+| Polityki (S9) | pakiety Cedar per aplikacja (`policies/<app>/`), parametry + overrides tylko zaostrzające, grounding z sesji, budżet z `spend_ledger` |
+| RBAC (P2) | role (`proxy.roles`) z grantami per tool lub całą aplikację; uprawnienia = rola ∪ `agent_permissions` |
+| Reguły UI (P4) | drzewo `when` / `then`, first match wins, `allow` / `deny` / `needs_ai`; ewaluator w Pythonie |
+| Kwoty (P6) | `proxy.quotas` (`1m` / `1h` / `1d`, `cap + burst`) + `limits.requests_per_minute`; `429 rate_limited` + `Retry-After` |
+| HITL (S11) | `202 pending_approval`, long-poll `GET /v1/approvals/{id}?wait=30`, approve = jednokrotne wykonanie zapamiętanego requestu (hash), reject z feedbackiem, timeout → `expired`, allow-temporary, 3 odmowy → `session_terminated` |
+| Hop A — LLM (D12) | tylko obserwacja: auth, allowlista modeli, hopy, `tool_calls` i skan wejścia do stanu sesji |
+| Awarie (D14) | read → fail-open, write → fail-closed, `degraded` w audycie |
+| Audyt (A1–A3) | jedno źródło: `proxy.decisions` (+ `hops`, `approvals`); `chain[]` w formacie UI, `args_redacted` |
+| Admin API | `/api/v1` wg `docs/api` — patrz niżej |
+| Konfiguracja (D17) | snapshot w pamięci, przebudowa po `NOTIFY proxy_config` (debounce), błędny snapshot = zostaje poprzedni |
+| Retencja (A7) | job wg `audit.retention_days`; wygaszanie approvali co 2 s |
 
-Bez uwierzytelniania agentów, sesji, audytu i pipeline'u decyzyjnego (kolejne kroki).
+## Endpointy agenta
 
-### Zachowanie
+| Endpoint | Opis |
+|---|---|
+| `POST /v1/sessions` `{task}` | nowa sesja → `{session_id}` |
+| `POST /v1/sessions/{id}/close` | zamknięcie sesji |
+| `GET/POST/PUT/PATCH/DELETE /apps/{app_id}/{path}` | hop B — egzekwowanie; wymaga `X-Session-Id` |
+| `POST /v1/chat/completions` | hop A — LLM (OpenAI-compatible); `X-Session-Id` opcjonalne |
+| `GET /v1/approvals/{id}?wait=30` | long-poll decyzji człowieka |
 
-- Konfiguracja aplikacji wczytywana z `proxy.apps` przy starcie.
-- Proxy usuwa z requestu agenta: `Authorization`, `Cookie`, `X-Session-Id`, `X-Request-Id`, `X-On-Behalf-Of`, nagłówki hop-by-hop i wymienione w `Connection`.
-- Proxy dokłada poświadczenia upstreamu (`bearer`, `api_key_header`, `basic`, `aws_sigv4`) i `X-Request-Id` (zwracany też agentowi).
-- Z odpowiedzi usuwa `Set-Cookie` i nagłówki hop-by-hop.
-- LLM: `stream: true` → `400 stream_not_supported`.
-- Błędy upstreamu: `502 upstream_unavailable`, `504 upstream_timeout`, `502 upstream_response_too_large`; format `{"error": {"type", "code", "message"}}`.
+Odpowiedzi decyzji (D10) — bez uzasadnień, zawsze `decision_id` (także w nagłówku `X-Decision-Id`):
 
-### Baza danych
-
-- `DATABASE_URL` — hasło może zawierać znaki specjalne bez kodowania (`@ # / ? %` itd.); dane logowania są oddzielane od hosta po ostatnim `@`. Poprawnie zakodowane (`%40`) też działa.
-- `DATABASE_PASSWORD` (opcjonalne) — surowe hasło, nadpisuje to z URL; dla przypadków niejednoznacznych (np. hasło zawierające `%41`).
-- Supabase z ECS: session pooler, użytkownik `postgres.<project_ref>`, port 5432.
-- Obsługiwany parametr URL: `sslmode`.
-- Błąd połączenia przy starcie → log `database_connect_failed` z hostem, portem, użytkownikiem i bazą (bez hasła).
-
-### Logi
-
-JSON na stdout (CloudWatch na ECS), jedna linia na zdarzenie:
-
-| `event` | Kiedy | Pola |
+| HTTP | `status` | Kiedy |
 |---|---|---|
-| `http_request` | każdy request do proxy (poza `/health`) | `request_id`, `session_id`, `method`, `path`, `status`, `latency_ms` |
-| `upstream_exchange` | każde wywołanie upstreamu | `request_id`, `session_id`, `protocol`, `app`, `path`, `status`, `upstream_latency_ms`, `error`; dla LLM `model`, `usage`; przy `LOG_BODIES=true` `request_body`, `response_body` |
-| `startup` | start proxy | `config_revision`, `apps` |
+| status upstreamu | — | ALLOW |
+| `403` | `blocked` | automatyczna odmowa |
+| `400` | `invalid_arguments` | body niezgodne z `tools.input_schema` |
+| `202` | `pending_approval` | eskalacja; `approval_id`, `poll_url`, `expires_at` |
+| `429` | `rate_limited` | kwota; `retry_after_seconds` |
+| `403` | `session_terminated` | limit odmów w sesji |
+| `200` | `approved` / `rejected` / `expired` | wynik long-polla; `result` lub `feedback` |
 
-- `request_id` łączy wpisy jednego requestu; `session_id` (z nagłówka `X-Session-Id`, na razie podawany przez agenta, niezweryfikowany) łączy wszystkie requesty jednego zadania.
-- `LOG_BODIES` (domyślnie `true`) — treść requestów i odpowiedzi, przycinana do `LOG_BODY_MAX_CHARS`. Zawiera prompty i dane — wyłączyć poza dev.
-- Nagłówki (w tym poświadczenia) nie są logowane.
+## Admin API (`/api/v1`)
 
-CloudWatch Logs Insights — cała sesja:
+Auth: JWT Supabase (`SUPABASE_JWT_SECRET` dla HS256 lub `SUPABASE_URL` dla JWKS). Lokalnie `ADMIN_AUTH_DISABLED=true`. Błędy `{detail}`, walidacja → `400`. Każda zmiana konfiguracji zapisuje autora w `config_changes.changed_by`.
+
+| Zasób | Endpointy | Kontrakt |
+|---|---|---|
+| Overview | `GET /overview` | [overview.md](../docs/api/overview.md) |
+| Agents | `GET/POST /agents`, `GET/PATCH /agents/{id}`, `POST …/revoke`, `POST …/keys` (nowy klucz, pokazywany raz), `GET …/overview`, `GET …/posture` | [agents.md](../docs/api/agents.md) |
+| Rules | `GET/POST …/rules`, `PUT/DELETE …/rules/{id}`, `GET …/rules/meta`, `POST …/rules/dry-run` (reguły + Cedar) | [agents.md](../docs/api/agents.md) |
+| Quotas | `GET/POST /agents/{id}/quotas`, `PATCH /quotas/{id}` | [agents.md](../docs/api/agents.md) |
+| Approvals | `GET /approvals`, `GET /approvals/{id}`, `POST …/allow`, `…/deny`, `…/allow-temporary` | [approvals.md](../docs/api/approvals.md) |
+| Audit | `GET /audit`, `GET /audit/{id}` | [audit.md](../docs/api/audit.md) |
+| Sessions | `GET /sessions`, `GET /sessions/{id}` (timeline) | [sessions.md](../docs/api/sessions.md) |
+| Roles | `GET/POST /roles`, `GET/PATCH /roles/{id}`, `POST …/publish`, `…/archive` | [roles.md](../docs/api/roles.md) |
+| MCP | `GET /mcp`, `GET /mcp/{id}`, `PATCH /mcp/{id}` (włącz/wyłącz aplikację), `PATCH /mcp/{id}/tools/{tool}` (włącz/wyłącz tool, `kind`, `scanMode`) | [mcp.md](../docs/api/mcp.md) |
+| Policies | `GET /policies`, `GET/PUT /policies/{app}`, `PUT/DELETE /policies/{app}/overrides/{agent}` — walidacja przed zapisem | — |
+| Settings | `GET/PATCH /settings/workspace`, operatorzy (list / invite / resend / disable / enable) | [settings.md](../docs/api/settings.md) |
+| Profile | `GET /me` | [profile.md](../docs/api/profile.md) |
+| Specialists | `GET /specialists` — pusta lista do czasu modeli (tor M) | [specialists.md](../docs/api/specialists.md) |
+| Poza MVP → `501` | MCP attach / discover / hosted, Simulator | |
+
+Mapowanie: proxy `escalate` = UI `caution`. `chain[]` = `{stage: rbac | rules | specialist | human, outcome, detail}`.
+
+## Pipeline decyzyjny
 
 ```
-fields @timestamp, event, app, path, status, request_body, response_body
-| filter session_id = "ses_..."
-| sort @timestamp asc
+request → auth agenta → sesja → katalog akcji (nieznana trasa → DENY)
+  → hop request → walidacja input_schema → kwoty (→ rate_limited)
+  → RBAC (rola ∪ bezpośrednie) → enrichment (apps.enrichment, cache)
+  → Cedar (pakiet aplikacji, fakty z sesji, budżet z ledgera) + reguły UI (first match)
+  → MlScorer.score (dziś NullScorer) → agregator v0
+  → allow: upstream → hop response → capture do sesji → ledger
+  → deny: 403 (+ licznik odmów) · escalate: approval + 202 · rate_limited: 429
 ```
 
-### Bedrock
+Agregator v0: `deny` z polityk jest ostateczne; `escalate` z polityk → człowiek; `needs_ai` bez modeli → człowiek (gdy `specialistFailClosed`) lub allow; reguła UI `allow` pomija specjalistę, ale nie omija Cedar. Progi τ dla przyszłych sygnałów ML są w `app/pipeline/aggregator.py`.
 
-Endpoint: `https://bedrock-runtime.{region}.amazonaws.com/openai/v1/chat/completions`.
+### Wpięcie ML (tor M)
 
-| Uwierzytelnianie | Konfiguracja `proxy.apps` |
-|---|---|
-| Klucz API Bedrock | `auth_type = 'bearer'`, `auth_secret_env = 'BEDROCK_API_KEY'` |
-| IAM (SigV4) — zalecane na ECS | `auth_type = 'aws_sigv4'`, `aws_region = 'eu-north-1'`, `aws_service = 'bedrock'`; poświadczenia z łańcucha AWS (rola taska ECS, env, profil) |
+`app/pipeline/ml.py` — implementacja `MlScorer` (`score`, `scan`, `describe`) przekazana do `create_app(scorer=...)`. `score` dostaje akcję, agenta (mandat), stan sesji (w tym `signals` ze skanów i `llm_tool_calls`), enrichment i fakty. `scan` dostaje teksty z odpowiedzi aplikacji (`tools.scan_mode` / `scan`) i z wejścia do LLM. `describe` zasila `GET /api/v1/specialists`.
+
+## Konfiguracja
+
+Źródło prawdy: Postgres, schema `proxy` (ADR 0007). Pakiety polityk trzymamy też jako pliki w `policies/<app>/` (`policy.cedar`, `schema.cedarschema`, `params.json`, `params_schema.json`, `overrides.json`) — review i import do bazy.
+
+| Typ parametru | Łączenie z override | W Cedar |
+|---|---|---|
+| `allowlist` | część wspólna | `Set<String>` |
+| `max_money` | mniejsza | `<name>_minor`, `<name>_currency` |
+| `max_number` / `min_number` | mniejsza / większa | `Long` |
+| `flag` | `true` wygrywa | `Bool` |
+| `budget` | mniejsza per okno | `budget_<window>_minor` |
+
+Reguły Cedar: tylko `forbid` z `@id`, `@severity("deny" | "escalate")`, opcjonalnie `@message`. Fakty w `context` (zawsze obecne, brak danych = wartość najgorsza): `offer_seen_in_session`, `merchant_matches`, `price_matches`, `currency_matches`, `sku_needed`, `qty_ratio_pct`, `order_value_minor`, `order_seen_in_session`, `merchant_known`, `spent_<window>_minor`. Resource: `Merchant` (gdy aplikacja ma enrichment `merchant`) albo `Tool`.
 
 ## Uruchomienie
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 cp .env.example .env
 
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0001_config.sql
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0002_runtime.sql
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0003_aws_sigv4_auth.sql
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f seeds/dev.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0004_pipeline.sql   # migracje, których baza jeszcze nie ma
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f seeds/seed.sql
+python -m app.cli load-policies                  # policies/* → proxy.policy_packs
+python -m app.cli create-key purchasing-agent    # → SSM /one/dev/ai-agent/AGENT_KEY
 
 uvicorn app.main:app --reload --port 8080
 ```
 
 ```bash
-curl -s localhost:8080/apps/warehouse/low-stock
-curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
-  -d '{"model": "openai.gpt-oss-120b-1:0", "messages": [{"role": "user", "content": "Hello"}]}'
+KEY='Authorization: Bearer ak_...'   # z create-key
+SID=$(curl -s -XPOST localhost:8080/v1/sessions -H "$KEY" -H 'content-type: application/json' -d '{"task":"restock"}' | jq -r .session_id)
+curl -s localhost:8080/apps/warehouse/low-stock -H "$KEY" -H "X-Session-Id: $SID"
 ```
+
+### CLI
+
+| Komenda | Opis |
+|---|---|
+| `python -m app.cli create-key <agent_id>` | nowy klucz agenta (wypisany raz) |
+| `python -m app.cli load-policies [policies/<app> ...]` | import pakietów polityk z walidacją |
+| `python -m app.cli seed-demo [--sessions N]` | sesje i decyzje demo dla UI |
+| `python -m app.cli retention` | jednorazowa retencja audytu |
+
+### Seed
+
+Jeden plik `seeds/seed.sql` (można odpalać wielokrotnie): aplikacje, katalog akcji, rola, agent `purchasing-agent`, kwota. Proxy forwarduje tylko do:
+
+| App | Upstream | Auth |
+|---|---|---|
+| `bedrock` | `https://bedrock-runtime.eu-north-1.amazonaws.com/openai/v1` | SigV4 rolą taska (lokalnie `~/.aws`) |
+| `warehouse` | `http://backend:8000/api/v1` (one-backend, Service Connect) | Bearer `GATEWAY_TOKEN` |
+| `marketplace` | `https://one-dev-2-alb-1648560586.eu-north-1.elb.amazonaws.com` (two-backend; cert z `certs/backend-2-ca.crt`, dołożony w Dockerfile) | Bearer `MARKETPLACE_API_TOKEN` |
+
+Klucz agenta: jeden per agent, `python -m app.cli create-key <agent_id>` (wypisany raz, w bazie tylko hash) — identyfikuje agenta. Task ECS musi mieć w env każdą zmienną z `proxy.apps.auth_secret_env`, inaczej proxy nie startuje.
+
+### Baza danych
+
+- `DATABASE_URL` — hasło może zawierać znaki specjalne bez kodowania; `DATABASE_PASSWORD` nadpisuje hasło z URL.
+- Supabase z ECS: session pooler (LISTEN/NOTIFY wymaga połączenia sesyjnego, nie transaction poolera), użytkownik `postgres.<project_ref>`, port 5432.
+
+### Logi
+
+JSON na stdout, jedna linia na zdarzenie: `http_request`, `decision` (werdykt, kody powodów, `degraded`), `upstream_exchange` (przy `LOG_BODIES=true` z treścią), `config_reloaded` / `config_reload_failed`, `startup`. `request_id`, `session_id`, `agent_id` łączą wpisy. Klucze agentów i poświadczenia upstreamów nie są logowane.
 
 ## Testy
 
 ```bash
-pytest
-TEST_DATABASE_URL=postgresql://... pytest
+pytest                                            # jednostkowe; testy z bazą są pomijane
+TEST_DATABASE_URL=postgresql://... pytest         # pełny zestaw (CI: postgres:16)
 ```
 
-Bez `TEST_DATABASE_URL` test wczytywania konfiguracji z Postgresa jest pomijany. Uwaga: test usuwa i odtwarza schema `proxy` w podanej bazie — używać tylko bazy testowej.
+Testy z bazą usuwają i odtwarzają schema `proxy` przed każdym testem — tylko baza testowa.

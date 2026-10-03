@@ -1,0 +1,45 @@
+entity Agent;
+entity Merchant {
+  country: String,
+  domain_age_days: Long,
+  verified: Bool,
+  reputation_pct: Long,
+  known: Bool,
+};
+entity Tool {
+  kind: String,
+};
+
+type PlaceOrderParams = {
+  allowed_countries: Set<String>,
+  max_order_value_minor: Long,
+  max_order_value_currency: String,
+  max_qty_ratio_pct: Long,
+  min_merchant_age_days: Long,
+  require_grounded_offer: Bool,
+  budget_24h_minor: Long,
+  budget_currency: String,
+};
+
+action "marketplace.place_order" appliesTo {
+  principal: Agent,
+  resource: Merchant,
+  context: {
+    params: PlaceOrderParams,
+    offer_seen_in_session: Bool,
+    merchant_matches: Bool,
+    price_matches: Bool,
+    currency_matches: Bool,
+    sku: String,
+    sku_needed: Bool,
+    quantity: Long,
+    qty_needed: Long,
+    qty_ratio_pct: Long,
+    order_value_minor: Long,
+    currency: String,
+    order_seen_in_session: Bool,
+    merchant_known: Bool,
+    merchant_id: String,
+    spent_24h_minor: Long,
+  },
+};
