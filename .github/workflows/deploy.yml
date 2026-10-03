@@ -1,0 +1,106 @@
+name: Build & Deploy to ECS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: eu-north-1
+  ECR_REPOSITORY: one-dev-proxy-server
+  ECS_CLUSTER: one-dev-cluster
+  ECS_SERVICE: one-dev-proxy-server
+  DEPLOY_ROLE_ARN: arn:aws:iam::206135621036:role/one-dev-github-deploy-proxy-server
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy-proxy-server
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run tests
+        env:
+          TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+        run: pytest -q
+
+  build-and-deploy:
+    needs: test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.com
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image tag
+        run: |
+          echo "IMAGE=${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}" >> $GITHUB_ENV
+          echo "IMAGE_TAG=$(TZ=Europe/Warsaw date +'%Y-%m-%d_%H_%M')-${GITHUB_SHA::7}" >> $GITHUB_ENV
+
+      - name: Build
+        run: |
+          docker build \
+            --platform linux/amd64 \
+            -t ${{ env.IMAGE }}:${{ env.IMAGE_TAG }} \
+            -t ${{ env.IMAGE }}:latest .
+
+      - name: Push
+        run: |
+          docker push ${{ env.IMAGE }}:${{ env.IMAGE_TAG }}
+          docker push ${{ env.IMAGE }}:latest
+          echo "Pushed: \`${{ env.IMAGE }}:${{ env.IMAGE_TAG }}\` and \`${{ env.IMAGE }}:latest\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Deploy to ECS
+        run: |
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE }} \
+            --force-new-deployment \
+            --query 'service.deployments[0].id' --output text
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }}
+          echo "Deployed to ECS service \`${{ env.ECS_SERVICE }}\`" >> $GITHUB_STEP_SUMMARY
