@@ -25,6 +25,28 @@ Bez uwierzytelniania agentów, sesji, audytu i pipeline'u decyzyjnego (kolejne k
 - LLM: `stream: true` → `400 stream_not_supported`.
 - Błędy upstreamu: `502 upstream_unavailable`, `504 upstream_timeout`, `502 upstream_response_too_large`; format `{"error": {"type", "code", "message"}}`.
 
+### Logi
+
+JSON na stdout (CloudWatch na ECS), jedna linia na zdarzenie:
+
+| `event` | Kiedy | Pola |
+|---|---|---|
+| `http_request` | każdy request do proxy (poza `/health`) | `request_id`, `session_id`, `method`, `path`, `status`, `latency_ms` |
+| `upstream_exchange` | każde wywołanie upstreamu | `request_id`, `session_id`, `protocol`, `app`, `path`, `status`, `upstream_latency_ms`, `error`; dla LLM `model`, `usage`; przy `LOG_BODIES=true` `request_body`, `response_body` |
+| `startup` | start proxy | `config_revision`, `apps` |
+
+- `request_id` łączy wpisy jednego requestu; `session_id` (z nagłówka `X-Session-Id`, na razie podawany przez agenta, niezweryfikowany) łączy wszystkie requesty jednego zadania.
+- `LOG_BODIES` (domyślnie `true`) — treść requestów i odpowiedzi, przycinana do `LOG_BODY_MAX_CHARS`. Zawiera prompty i dane — wyłączyć poza dev.
+- Nagłówki (w tym poświadczenia) nie są logowane.
+
+CloudWatch Logs Insights — cała sesja:
+
+```
+fields @timestamp, event, app, path, status, request_body, response_body
+| filter session_id = "ses_..."
+| sort @timestamp asc
+```
+
 ### Bedrock
 
 Endpoint: `https://bedrock-runtime.{region}.amazonaws.com/openai/v1/chat/completions`.

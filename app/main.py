@@ -1,3 +1,5 @@
+import logging
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from uuid import uuid4
@@ -11,11 +13,14 @@ from fastapi.responses import Response
 from app.adapters import llm, rest
 from app.config.loader import load_snapshot
 from app.config.models import ConfigSnapshot
+from app.core.logging import configure_logging
 from app.core.settings import Settings, get_settings
 from app.upstream.auth import Authenticator
 from app.upstream.client import UpstreamClient
 
 REQUEST_ID_HEADER = "X-Request-Id"
+
+logger = logging.getLogger("proxy.http")
 
 
 def create_app(
@@ -25,6 +30,7 @@ def create_app(
     aws_credentials: Credentials | None = None,
 ) -> FastAPI:
     settings = settings or get_settings()
+    configure_logging(settings.log_level)
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
@@ -37,6 +43,16 @@ def create_app(
         else:
             application.state.snapshot = snapshot
         application.state.db = pool
+        logger.info(
+            "startup",
+            extra={
+                "fields": {
+                    "config_revision": application.state.snapshot.revision,
+                    "apps": sorted(application.state.snapshot.apps),
+                    "log_bodies": settings.log_bodies,
+                }
+            },
+        )
 
         async with httpx.AsyncClient(transport=transport, follow_redirects=False) as http:
             application.state.upstream = UpstreamClient(
@@ -60,7 +76,23 @@ def create_app(
     @application.middleware("http")
     async def request_id(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
         request.state.request_id = f"req_{uuid4().hex}"
-        response = await call_next(request)
+        started = time.perf_counter()
+        fields = {
+            "request_id": request.state.request_id,
+            "session_id": request.headers.get("x-session-id"),
+            "method": request.method,
+            "path": request.url.path,
+            "client": request.client.host if request.client else None,
+        }
+        try:
+            response = await call_next(request)
+        except Exception:
+            fields["latency_ms"] = round((time.perf_counter() - started) * 1000, 1)
+            logger.exception("http_request_failed", extra={"fields": fields})
+            raise
+        fields |= {"status": response.status_code, "latency_ms": round((time.perf_counter() - started) * 1000, 1)}
+        if request.url.path != "/health":
+            logger.info("http_request", extra={"fields": fields})
         response.headers[REQUEST_ID_HEADER] = request.state.request_id
         return response
 

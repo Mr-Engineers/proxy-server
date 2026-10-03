@@ -15,6 +15,9 @@ class Settings(BaseSettings):
     database_url: str = ""
     max_request_bytes: int = 1_048_576
     max_response_bytes: int = 10_485_760
+    log_level: str = "INFO"
+    log_bodies: bool = True
+    log_body_max_chars: int = 8000
 
 
 @lru_cache
