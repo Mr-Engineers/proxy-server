@@ -1,0 +1,2395 @@
+openapi: 3.1.0
+info:
+  title: proxy-server
+  version: 0.2.0
+  description: |
+    Security proxy — jedyny punkt wyjścia agenta. Ruch do LLM (hop A), aplikacji (hop B), MCP i innych agentów
+    przechodzi przez proxy.
+
+    Dwie powierzchnie:
+
+    - **Agent API** (`/v1/*`, `/apps/*`) — uwierzytelnienie kluczem agenta `Authorization: Bearer ak_<key_id>_<secret>`.
+      Błędy w kształcie `{error: {type, code, message}}`; odpowiedzi decyzji (D10) zawsze niosą `decision_id`
+      (także w nagłówku `X-Decision-Id`) i nigdy nie zawierają uzasadnień.
+    - **Admin API** (`/api/v1/*`) — control plane dla UI, JWT Supabase. Błędy `{detail}`, błąd walidacji → `400`.
+
+    Każda odpowiedź ma nagłówek `X-Request-Id`.
+servers:
+  - url: http://localhost:8080
+    description: Lokalnie (`uvicorn app.main:app --port 8080`)
+tags:
+  - name: Health
+  - name: Agent
+    description: Sesje agenta i long-poll approvali.
+  - name: LLM
+    description: Hop A — OpenAI-compatible, tylko obserwacja.
+  - name: Apps
+    description: Hop B — egzekwowanie polityk przed wywołaniem aplikacji.
+  - name: Overview
+  - name: Agents
+  - name: Rules
+  - name: Quotas
+  - name: Approvals
+  - name: Audit
+  - name: Sessions
+  - name: Roles
+  - name: MCP
+  - name: Policies
+  - name: Settings
+  - name: Profile
+  - name: Specialists
+  - name: Simulator
+
+paths:
+  /health:
+    get:
+      tags: [Health]
+      summary: Health check
+      operationId: health
+      security: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, config_revision]
+                properties:
+                  status: { type: string, const: ok }
+                  config_revision: { type: integer, description: Rewizja snapshotu konfiguracji w pamięci. }
+
+  # ------------------------------------------------------------------ Agent API
+
+  /v1/sessions:
+    post:
+      tags: [Agent]
+      summary: Utwórz sesję
+      operationId: createSession
+      security: [{ agentKey: [] }]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                task: { type: [string, "null"], maxLength: 4000, description: Opis zadania agenta. }
+            example: { task: restock }
+      responses:
+        "201":
+          description: Sesja utworzona
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [session_id, agent_id, status, created_at]
+                properties:
+                  session_id: { type: string, example: sess_3f9a1c0b2d4e5f6a7b8c }
+                  agent_id: { type: string, example: purchasing-agent }
+                  status: { $ref: "#/components/schemas/SessionStatus" }
+                  created_at: { type: string, format: date-time }
+        "401": { $ref: "#/components/responses/AgentUnauthorized" }
+        "403": { $ref: "#/components/responses/AgentForbidden" }
+
+  /v1/sessions/{session_id}/close:
+    post:
+      tags: [Agent]
+      summary: Zamknij sesję
+      operationId: closeSession
+      security: [{ agentKey: [] }]
+      parameters:
+        - { name: session_id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Sesja zamknięta (lub już nieaktywna — zwracany jest bieżący status)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [session_id, status]
+                properties:
+                  session_id: { type: string }
+                  status: { $ref: "#/components/schemas/SessionStatus" }
+        "401": { $ref: "#/components/responses/AgentUnauthorized" }
+        "403": { $ref: "#/components/responses/AgentForbidden" }
+        "404":
+          description: "`unknown_session` — sesja nie istnieje albo należy do innego agenta"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AgentError" }
+
+  /v1/approvals/{approval_id}:
+    get:
+      tags: [Agent]
+      summary: Long-poll decyzji człowieka
+      description: |
+        Przy `wait > 0` i statusie `pending` żądanie czeka do `wait` sekund na rozstrzygnięcie.
+        Po zatwierdzeniu `approved` pojawia się dopiero po wykonaniu zapamiętanego requestu (do tego czasu `202`).
+      operationId: pollApproval
+      security: [{ agentKey: [] }]
+      parameters:
+        - { name: approval_id, in: path, required: true, schema: { type: string } }
+        - name: wait
+          in: query
+          description: Maksymalny czas oczekiwania w sekundach.
+          schema: { type: integer, minimum: 0, maximum: 30, default: 0 }
+      responses:
+        "200":
+          description: Rozstrzygnięte — `approved`, `rejected` albo `expired`
+          headers:
+            X-Decision-Id: { $ref: "#/components/headers/X-Decision-Id" }
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/ApprovalApproved"
+                  - $ref: "#/components/schemas/ApprovalRejected"
+                  - $ref: "#/components/schemas/ApprovalExpired"
+                discriminator: { propertyName: status }
+        "202":
+          description: Wciąż oczekuje na człowieka (albo zatwierdzone, ale jeszcze niewykonane)
+          headers:
+            X-Decision-Id: { $ref: "#/components/headers/X-Decision-Id" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApprovalPending" }
+        "401": { $ref: "#/components/responses/AgentUnauthorized" }
+        "403": { $ref: "#/components/responses/AgentForbidden" }
+        "404":
+          description: "`unknown_approval`"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AgentError" }
+        "422":
+          description: "`wait` poza zakresem 0–30"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ValidationErrorList" }
+
+  /v1/chat/completions:
+    post:
+      tags: [LLM]
+      summary: Chat completions (hop A)
+      description: |
+        OpenAI-compatible, przekazywane do skonfigurowanego upstreamu LLM bez zmian. Proxy tylko obserwuje:
+        uwierzytelnia agenta, sprawdza allowlistę modeli (`llmModels`, pusta = dowolny), a z `X-Session-Id`
+        zapisuje hopy, `tool_calls` z odpowiedzi i skan wejścia do stanu sesji. Streaming nie jest obsługiwany.
+      operationId: chatCompletions
+      security: [{ agentKey: [] }]
+      parameters:
+        - $ref: "#/components/parameters/SessionIdOptional"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Body w formacie OpenAI Chat Completions.
+              required: [model, messages]
+              additionalProperties: true
+              properties:
+                model: { type: string }
+                messages:
+                  type: array
+                  items:
+                    type: object
+                    additionalProperties: true
+                    properties:
+                      role: { type: string, enum: [system, user, assistant, tool] }
+                      content:
+                        oneOf:
+                          - type: string
+                          - type: array
+                            items: { type: object, additionalProperties: true }
+                stream: { type: boolean, const: false }
+                tools: { type: array, items: { type: object, additionalProperties: true } }
+      responses:
+        "200":
+          description: Odpowiedź upstreamu (status i body przekazane 1:1)
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "400":
+          description: "`invalid_json`, `stream_not_supported`, `session_required`"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AgentError" }
+        "401": { $ref: "#/components/responses/AgentUnauthorized" }
+        "403":
+          description: "`agent_disabled`, `model_not_allowed`, `invalid_session`, `session_closed`, `session_terminated`"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AgentError" }
+        "413": { $ref: "#/components/responses/RequestTooLarge" }
+        "502": { $ref: "#/components/responses/UpstreamError" }
+        "503":
+          description: "`llm_not_configured`"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AgentError" }
+        "504": { $ref: "#/components/responses/UpstreamError" }
+
+  /apps/{app_id}/{path}:
+    parameters:
+      - name: app_id
+        in: path
+        required: true
+        description: Aplikacja REST z `proxy.apps` (np. `warehouse`, `marketplace`).
+        schema: { type: string }
+        example: warehouse
+      - name: path
+        in: path
+        required: true
+        description: |
+          Ścieżka upstreamu (może zawierać `/`). Dopasowywana do katalogu akcji (`proxy.tools`);
+          nieznana trasa = DENY. Segmenty `.` i `..` są odrzucane.
+        schema: { type: string }
+        example: low-stock
+      - $ref: "#/components/parameters/SessionIdRequired"
+    get: &appCall
+      tags: [Apps]
+      summary: Wywołanie aplikacji przez proxy (hop B)
+      description: |
+        Pipeline: auth agenta → sesja → katalog akcji (nieznana trasa → DENY) → walidacja `input_schema` → kwoty →
+        RBAC → enrichment → Cedar + reguły UI → sygnały ML → agregator.
+
+        - **ALLOW** — request idzie do upstreamu z nagłówkiem `X-On-Behalf-Of`; status i body upstreamu wracają 1:1.
+        - **DENY** — `403 blocked` (albo `400 invalid_arguments` przy niezgodności z `input_schema`);
+          po przekroczeniu limitu odmów w sesji — `403 session_terminated`.
+        - **ESCALATE** — `202 pending_approval`; wynik przez `GET /v1/approvals/{id}?wait=30`.
+        - **RATE_LIMITED** — `429` z `Retry-After`.
+
+        Query, parametry ścieżki i body są przekazywane bez zmian.
+      security: [{ agentKey: [] }]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        "200":
+          description: ALLOW — odpowiedź upstreamu (dowolny status upstreamu przekazywany 1:1)
+          headers:
+            X-Decision-Id: { $ref: "#/components/headers/X-Decision-Id" }
+          content:
+            application/json:
+              schema: {}
+        "202":
+          description: Eskalacja do człowieka
+          headers:
+            X-Decision-Id: { $ref: "#/components/headers/X-Decision-Id" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DecisionPendingApproval" }
+        "400":
+          description: "`invalid_arguments` (decyzja), albo `invalid_path` / `session_required` (`AgentError`)"
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/DecisionResponse"
+                  - $ref: "#/components/schemas/AgentError"
+        "401": { $ref: "#/components/responses/AgentUnauthorized" }
+        "403":
+          description: |
+            `blocked` / `session_terminated` (decyzja), albo `agent_disabled`, `invalid_session`,
+            `session_closed`, `session_terminated` przy wejściu (`AgentError`)
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/DecisionResponse"
+                  - $ref: "#/components/schemas/AgentError"
+        "404":
+          description: "`unknown_app`"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AgentError" }
+        "413": { $ref: "#/components/responses/RequestTooLarge" }
+        "429":
+          description: Przekroczona kwota
+          headers:
+            X-Decision-Id: { $ref: "#/components/headers/X-Decision-Id" }
+            Retry-After: { $ref: "#/components/headers/Retry-After" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DecisionRateLimited" }
+        "502": { $ref: "#/components/responses/UpstreamError" }
+        "504": { $ref: "#/components/responses/UpstreamError" }
+    post: *appCall
+    put: *appCall
+    patch: *appCall
+    delete: *appCall
+
+  # ------------------------------------------------------------------ Admin API
+
+  /api/v1/overview:
+    get:
+      tags: [Overview]
+      summary: Metryki globalne
+      operationId: getOverview
+      parameters:
+        - $ref: "#/components/parameters/Range"
+        - $ref: "#/components/parameters/From"
+        - $ref: "#/components/parameters/To"
+        - $ref: "#/components/parameters/Tz"
+        - $ref: "#/components/parameters/Bucket"
+        - $ref: "#/components/parameters/TopLimit"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Overview" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/v1/agents:
+    get:
+      tags: [Agents]
+      summary: Lista agentów
+      operationId: listAgents
+      parameters:
+        - $ref: "#/components/parameters/Search"
+        - name: status
+          in: query
+          description: Wiele wartości — powtórzony parametr albo lista po przecinku.
+          schema: { type: array, items: { $ref: "#/components/schemas/AgentStatus" } }
+          style: form
+          explode: true
+        - { name: role_id, in: query, schema: { type: string } }
+        - name: sort
+          in: query
+          schema: { type: string, enum: [name, role, status, api_key, last_seen], default: last_seen }
+        - $ref: "#/components/parameters/SortDir"
+        - $ref: "#/components/parameters/Limit50"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AgentPage" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    post:
+      tags: [Agents]
+      summary: Utwórz agenta (z pierwszym kluczem)
+      operationId: createAgent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AgentCreate" }
+      responses:
+        "201":
+          description: Utworzony; `apiKey` pokazywany tylko raz
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AgentWithKey" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/v1/agents/{agent_id}:
+    parameters: [{ $ref: "#/components/parameters/AgentId" }]
+    get:
+      tags: [Agents]
+      summary: Szczegóły agenta
+      operationId: getAgent
+      responses:
+        "200": { $ref: "#/components/responses/Agent" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [Agents]
+      summary: Edytuj agenta
+      operationId: patchAgent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AgentPatch" }
+      responses:
+        "200": { $ref: "#/components/responses/Agent" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/v1/agents/{agent_id}/revoke:
+    parameters: [{ $ref: "#/components/parameters/AgentId" }]
+    post:
+      tags: [Agents]
+      summary: Unieważnij wszystkie klucze agenta
+      description: Ustawia status `revoked`. Przywrócenie — przez wygenerowanie nowego klucza.
+      operationId: revokeAgent
+      responses:
+        "200": { $ref: "#/components/responses/Agent" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/agents/{agent_id}/keys:
+    parameters: [{ $ref: "#/components/parameters/AgentId" }]
+    post:
+      tags: [Agents]
+      summary: Nowy klucz agenta
+      description: |
+        Klucz pokazywany tylko raz. Stare klucze zostają aktywne do `revoke` (rotacja bez przestoju).
+        Agent w statusie `revoked` wraca do `active`.
+      operationId: createAgentKey
+      responses:
+        "201":
+          description: Klucz utworzony
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AgentWithKey" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/agents/{agent_id}/overview:
+    parameters: [{ $ref: "#/components/parameters/AgentId" }]
+    get:
+      tags: [Agents]
+      summary: Metryki agenta
+      operationId: getAgentOverview
+      parameters:
+        - $ref: "#/components/parameters/Range"
+        - $ref: "#/components/parameters/From"
+        - $ref: "#/components/parameters/To"
+        - $ref: "#/components/parameters/Tz"
+        - $ref: "#/components/parameters/Bucket"
+        - $ref: "#/components/parameters/TopLimit"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AgentOverview" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/agents/{agent_id}/posture:
+    parameters: [{ $ref: "#/components/parameters/AgentId" }]
+    get:
+      tags: [Agents]
+      summary: Efektywne uprawnienia agenta
+      operationId: getAgentPosture
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AgentPosture" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/agents/{agent_id}/mcp/{server_id}:
+    parameters:
+      - $ref: "#/components/parameters/AgentId"
+      - $ref: "#/components/parameters/ServerId"
+    post:
+      tags: [Agents]
+      summary: Podłącz serwer MCP do agenta (poza MVP)
+      operationId: attachAgentMcp
+      responses:
+        "501": { $ref: "#/components/responses/NotImplemented" }
+    delete:
+      tags: [Agents]
+      summary: Odłącz serwer MCP od agenta (poza MVP)
+      operationId: detachAgentMcp
+      responses:
+        "501": { $ref: "#/components/responses/NotImplemented" }
+
+  /api/v1/agents/{agent_id}/mcp/{server_id}/auth:
+    parameters:
+      - $ref: "#/components/parameters/AgentId"
+      - $ref: "#/components/parameters/ServerId"
+    post:
+      tags: [Agents]
+      summary: Autoryzacja MCP dla agenta (poza MVP)
+      operationId: authAgentMcp
+      responses:
+        "501": { $ref: "#/components/responses/NotImplemented" }
+
+  /api/v1/agents/{agent_id}/rules:
+    parameters: [{ $ref: "#/components/parameters/AgentId" }]
+    get:
+      tags: [Rules]
+      summary: Reguły agenta (w kolejności ewaluacji)
+      operationId: listRules
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/Rule" } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      tags: [Rules]
+      summary: Dodaj regułę
+      description: Bez `position` reguła trafia na koniec listy.
+      operationId: createRule
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RuleBody" }
+      responses:
+        "201": { $ref: "#/components/responses/Rule" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/agents/{agent_id}/rules/{rule_id}:
+    parameters:
+      - $ref: "#/components/parameters/AgentId"
+      - { name: rule_id, in: path, required: true, schema: { type: string } }
+    put:
+      tags: [Rules]
+      summary: Zastąp regułę
+      description: Bez `position` pozycja zostaje bez zmian.
+      operationId: updateRule
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RuleBody" }
+      responses:
+        "200": { $ref: "#/components/responses/Rule" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [Rules]
+      summary: Usuń regułę
+      operationId: deleteRule
+      responses:
+        "204": { description: Usunięta }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/agents/{agent_id}/rules/meta:
+    parameters: [{ $ref: "#/components/parameters/AgentId" }]
+    get:
+      tags: [Rules]
+      summary: Metadane edytora reguł
+      description: Toole per aplikacja, pola dostępne w warunkach (z `input_schema`, `args` i faktów) oraz próbki do dry-run.
+      operationId: getRulesMeta
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RulesMeta" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/agents/{agent_id}/rules/dry-run:
+    parameters: [{ $ref: "#/components/parameters/AgentId" }]
+    post:
+      tags: [Rules]
+      summary: Dry-run reguł + Cedar
+      description: |
+        Bez `rules` używa zapisanych reguł agenta; z `rules` — szkicu (np. niezapisanych zmian z edytora).
+        Gdy `tool` istnieje w katalogu, odpowiedź zawiera też wynik pakietu Cedar (`policy`).
+      operationId: dryRunRules
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DryRunBody" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DryRunResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/agents/{agent_id}/quotas:
+    parameters: [{ $ref: "#/components/parameters/AgentId" }]
+    get:
+      tags: [Quotas]
+      summary: Kwoty agenta
+      operationId: listQuotas
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/Quota" } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      tags: [Quotas]
+      summary: Dodaj kwotę
+      operationId: createQuota
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/QuotaCreate" }
+      responses:
+        "201": { $ref: "#/components/responses/Quota" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/quotas/{quota_id}:
+    parameters:
+      - { name: quota_id, in: path, required: true, schema: { type: string } }
+    patch:
+      tags: [Quotas]
+      summary: Edytuj kwotę
+      operationId: patchQuota
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/QuotaPatch" }
+      responses:
+        "200": { $ref: "#/components/responses/Quota" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/approvals:
+    get:
+      tags: [Approvals]
+      summary: Kolejka oczekujących approvali
+      description: Tylko `pending` i nieprzeterminowane.
+      operationId: listApprovals
+      parameters:
+        - $ref: "#/components/parameters/Search"
+        - { name: agent_id, in: query, schema: { type: string } }
+        - name: sort
+          in: query
+          description: "`age` sortuje po wieku (desc = najstarsze pierwsze)."
+          schema: { type: string, enum: [age, created_at, ttl, tool, agent], default: age }
+        - $ref: "#/components/parameters/SortDir"
+        - $ref: "#/components/parameters/Limit50"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, nextCursor]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/Approval" } }
+                  nextCursor: { $ref: "#/components/schemas/NextCursor" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/v1/approvals/{approval_id}:
+    parameters: [{ $ref: "#/components/parameters/ApprovalId" }]
+    get:
+      tags: [Approvals]
+      summary: Szczegóły approvala
+      operationId: getApproval
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Approval" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/approvals/{approval_id}/allow:
+    parameters: [{ $ref: "#/components/parameters/ApprovalId" }]
+    post:
+      tags: [Approvals]
+      summary: Zatwierdź jednorazowo
+      description: Wykonuje zapamiętany request dokładnie raz.
+      operationId: allowApproval
+      responses:
+        "200": { $ref: "#/components/responses/ApprovalResolution" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/v1/approvals/{approval_id}/deny:
+    parameters: [{ $ref: "#/components/parameters/ApprovalId" }]
+    post:
+      tags: [Approvals]
+      summary: Odrzuć
+      description: "`reason` trafia do agenta jako `feedback`."
+      operationId: denyApproval
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: [string, "null"], maxLength: 2000 }
+      responses:
+        "200": { $ref: "#/components/responses/ApprovalResolution" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/v1/approvals/{approval_id}/allow-temporary:
+    parameters: [{ $ref: "#/components/parameters/ApprovalId" }]
+    post:
+      tags: [Approvals]
+      summary: Zatwierdź i przyznaj tymczasowy grant
+      description: |
+        Wykonuje request i tworzy grant na (agent, tool) na `ttlSeconds`.
+        Domyślnie `defaultApprovalTtlSeconds` z ustawień workspace.
+      operationId: allowApprovalTemporary
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ttlSeconds: { type: [integer, "null"], minimum: 60, maximum: 86400 }
+      responses:
+        "200": { $ref: "#/components/responses/ApprovalResolution" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/v1/audit:
+    get:
+      tags: [Audit]
+      summary: Log decyzji
+      operationId: listAudit
+      parameters:
+        - name: search
+          in: query
+          description: Szuka w nazwie toola i w `argsRedacted`.
+          schema: { type: string }
+        - { name: agent_id, in: query, schema: { type: string } }
+        - { name: agent_name, in: query, description: "ILIKE (można użyć `%`).", schema: { type: string } }
+        - name: decision
+          in: query
+          description: Wiele wartości — powtórzony parametr albo lista po przecinku.
+          schema: { type: array, items: { $ref: "#/components/schemas/UiDecision" } }
+          style: form
+          explode: true
+        - $ref: "#/components/parameters/From"
+        - $ref: "#/components/parameters/To"
+        - { name: tool, in: query, description: Prefiks nazwy toola., schema: { type: string } }
+        - { name: session_id, in: query, schema: { type: string } }
+        - name: sort
+          in: query
+          schema: { type: string, enum: [time, tool, agent, decision], default: time }
+        - $ref: "#/components/parameters/SortDir"
+        - $ref: "#/components/parameters/Limit50"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, nextCursor]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/AuditEvent" } }
+                  nextCursor: { $ref: "#/components/schemas/NextCursor" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/v1/audit/{event_id}:
+    parameters:
+      - { name: event_id, in: path, required: true, description: "`decision_id`", schema: { type: string } }
+    get:
+      tags: [Audit]
+      summary: Szczegóły decyzji
+      operationId: getAuditEvent
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuditEventDetail" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/sessions:
+    get:
+      tags: [Sessions]
+      summary: Lista sesji (od ostatniej aktywności)
+      operationId: listSessions
+      parameters:
+        - { name: agent_id, in: query, schema: { type: string } }
+        - { name: status, in: query, schema: { $ref: "#/components/schemas/SessionStatus" } }
+        - $ref: "#/components/parameters/Limit50"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, nextCursor]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/Session" } }
+                  nextCursor: { $ref: "#/components/schemas/NextCursor" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/v1/sessions/{session_id}:
+    parameters:
+      - { name: session_id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [Sessions]
+      summary: Sesja z timeline (hopy + decyzje + approvale)
+      operationId: getSession
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionDetail" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/roles:
+    get:
+      tags: [Roles]
+      summary: Lista ról
+      operationId: listRoles
+      parameters:
+        - $ref: "#/components/parameters/Search"
+        - { name: status, in: query, schema: { $ref: "#/components/schemas/RoleStatus" } }
+        - name: sort
+          in: query
+          schema: { type: string, enum: [name, status, agents, grants, updated], default: updated }
+        - $ref: "#/components/parameters/SortDir"
+        - $ref: "#/components/parameters/Limit50"
+        - $ref: "#/components/parameters/OffsetCursor"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, nextCursor]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/RoleSummary" } }
+                  nextCursor: { $ref: "#/components/schemas/NextCursor" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    post:
+      tags: [Roles]
+      summary: Utwórz rolę (draft)
+      description: Bez `id` generowane z nazwy jako `role_<slug>`.
+      operationId: createRole
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RoleCreate" }
+      responses:
+        "201": { $ref: "#/components/responses/Role" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/v1/roles/{role_id}:
+    parameters: [{ $ref: "#/components/parameters/RoleId" }]
+    get:
+      tags: [Roles]
+      summary: Szczegóły roli (macierz grantów)
+      operationId: getRole
+      responses:
+        "200": { $ref: "#/components/responses/Role" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [Roles]
+      summary: Edytuj rolę
+      description: "`grants` zastępuje granty tylko dla wymienionych aplikacji. Roli `archived` nie można zmieniać grantów."
+      operationId: patchRole
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RolePatch" }
+      responses:
+        "200": { $ref: "#/components/responses/Role" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/v1/roles/{role_id}/publish:
+    parameters: [{ $ref: "#/components/parameters/RoleId" }]
+    post:
+      tags: [Roles]
+      summary: "Opublikuj rolę (draft → active)"
+      operationId: publishRole
+      responses:
+        "200": { $ref: "#/components/responses/Role" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/v1/roles/{role_id}/archive:
+    parameters: [{ $ref: "#/components/parameters/RoleId" }]
+    post:
+      tags: [Roles]
+      summary: "Zarchiwizuj rolę (active | draft → archived)"
+      operationId: archiveRole
+      responses:
+        "200": { $ref: "#/components/responses/Role" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/v1/mcp:
+    get:
+      tags: [MCP]
+      summary: Rejestr serwerów (aplikacje REST i MCP)
+      operationId: listServers
+      parameters:
+        - name: kind
+          in: query
+          description: "`hosted` zawsze zwraca pustą listę."
+          schema: { type: string, enum: [all, remote, hosted], default: all }
+        - { name: health, in: query, schema: { $ref: "#/components/schemas/ServerHealth" } }
+        - $ref: "#/components/parameters/Search"
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 100 }
+        - $ref: "#/components/parameters/OffsetCursor"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, nextCursor]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/Server" } }
+                  nextCursor: { $ref: "#/components/schemas/NextCursor" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/v1/mcp/hosted/source-options:
+    get:
+      tags: [MCP]
+      summary: Źródła dla hosted adapterów
+      operationId: listHostedSourceOptions
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  required: [id, label, blurb, urlPlaceholder]
+                  properties:
+                    id: { type: string, enum: [rest, openapi, database, package, template] }
+                    label: { type: string }
+                    blurb: { type: string }
+                    urlPlaceholder: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/v1/mcp/hosted:
+    post:
+      tags: [MCP]
+      summary: Dodaj hosted adapter (poza MVP)
+      operationId: createHostedServer
+      responses:
+        "501": { $ref: "#/components/responses/NotImplemented" }
+
+  /api/v1/mcp/hosted/discover:
+    post:
+      tags: [MCP]
+      summary: Discover hosted (poza MVP)
+      operationId: discoverHostedServer
+      responses:
+        "501": { $ref: "#/components/responses/NotImplemented" }
+
+  /api/v1/mcp/remote:
+    post:
+      tags: [MCP]
+      summary: Dodaj zdalny serwer MCP (poza MVP)
+      operationId: createRemoteServer
+      responses:
+        "501": { $ref: "#/components/responses/NotImplemented" }
+
+  /api/v1/mcp/remote/discover:
+    post:
+      tags: [MCP]
+      summary: Discover zdalnego serwera (poza MVP)
+      operationId: discoverRemoteServer
+      responses:
+        "501": { $ref: "#/components/responses/NotImplemented" }
+
+  /api/v1/mcp/{server_id}:
+    parameters: [{ $ref: "#/components/parameters/ServerId" }]
+    get:
+      tags: [MCP]
+      summary: Szczegóły serwera
+      operationId: getServer
+      responses:
+        "200": { $ref: "#/components/responses/Server" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [MCP]
+      summary: Włącz / wyłącz aplikację, zmień nazwę
+      operationId: patchServer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                enabled: { type: [boolean, "null"] }
+                name: { type: [string, "null"] }
+      responses:
+        "200": { $ref: "#/components/responses/Server" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [MCP]
+      summary: Usuń serwer (poza MVP — wyłącz zamiast tego)
+      operationId: deleteServer
+      responses:
+        "501": { $ref: "#/components/responses/NotImplemented" }
+
+  /api/v1/mcp/{server_id}/tools/{tool}:
+    parameters:
+      - $ref: "#/components/parameters/ServerId"
+      - name: tool
+        in: path
+        required: true
+        description: Nazwa toola, z prefiksem `<server_id>.` lub bez.
+        schema: { type: string }
+    patch:
+      tags: [MCP]
+      summary: Włącz / wyłącz tool, zmień `kind` lub `scanMode`
+      operationId: patchServerTool
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                enabled: { type: [boolean, "null"] }
+                kind: { oneOf: [{ $ref: "#/components/schemas/ToolKind" }, { type: "null" }] }
+                scanMode: { type: [string, "null"], enum: [all_strings, selected, none, null] }
+      responses:
+        "200": { $ref: "#/components/responses/Server" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/policies:
+    get:
+      tags: [Policies]
+      summary: Pakiety polityk Cedar
+      operationId: listPolicyPacks
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/PolicyPack" } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/v1/policies/{app_id}:
+    parameters:
+      - { name: app_id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [Policies]
+      summary: Pakiet polityk aplikacji
+      operationId: getPolicyPack
+      responses:
+        "200": { $ref: "#/components/responses/PolicyPack" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    put:
+      tags: [Policies]
+      summary: Zapisz pakiet (z walidacją)
+      description: Pominięte pola zostają bez zmian. Pakiet jest kompilowany przed zapisem — błąd → `400`, nic nie trafia do bazy.
+      operationId: putPolicyPack
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                cedarPolicies: { type: [string, "null"] }
+                cedarSchema: { type: [string, "null"] }
+                params: { type: [object, "null"], additionalProperties: true }
+                paramsSchema: { type: [object, "null"], additionalProperties: true }
+      responses:
+        "200": { $ref: "#/components/responses/PolicyPack" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/policies/{app_id}/overrides/{agent_id}:
+    parameters:
+      - { name: app_id, in: path, required: true, schema: { type: string } }
+      - $ref: "#/components/parameters/AgentId"
+    put:
+      tags: [Policies]
+      summary: Override parametrów dla agenta
+      description: Override może tylko zaostrzać parametry pakietu; luzujący → `400`.
+      operationId: putPolicyOverride
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [params]
+              properties:
+                params: { type: object, additionalProperties: true }
+      responses:
+        "200": { $ref: "#/components/responses/PolicyPack" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [Policies]
+      summary: Usuń override
+      operationId: deletePolicyOverride
+      responses:
+        "200": { $ref: "#/components/responses/PolicyPack" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/settings/workspace:
+    get:
+      tags: [Settings]
+      summary: Ustawienia workspace
+      operationId: getWorkspace
+      responses:
+        "200": { $ref: "#/components/responses/Workspace" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    patch:
+      tags: [Settings]
+      summary: Zmień ustawienia workspace
+      operationId: patchWorkspace
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                orgName: { type: [string, "null"], minLength: 1, maxLength: 120 }
+                defaultApprovalTtlSeconds: { type: [integer, "null"], enum: [300, 900, 1800, 3600, null] }
+                specialistFailClosed: { type: [boolean, "null"] }
+                auditRetentionDays: { type: [integer, "null"], enum: [30, 90, 180, 365, null] }
+                authMode: { type: [string, "null"], enum: [invite_only, null] }
+      responses:
+        "200": { $ref: "#/components/responses/Workspace" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/v1/settings/operators:
+    get:
+      tags: [Settings]
+      summary: Lista operatorów
+      operationId: listOperators
+      parameters:
+        - name: sort
+          in: query
+          schema: { type: string, enum: [name, email, role, status, invited, last_active], default: invited }
+        - $ref: "#/components/parameters/SortDir"
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 100 }
+        - $ref: "#/components/parameters/OffsetCursor"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, nextCursor]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/Operator" } }
+                  nextCursor: { $ref: "#/components/schemas/NextCursor" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/v1/settings/operators/invite:
+    post:
+      tags: [Settings]
+      summary: Zaproś operatora (owner / admin)
+      operationId: inviteOperator
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, role]
+              properties:
+                email: { type: string, format: email, maxLength: 320 }
+                role: { type: string, enum: [admin, operator, viewer] }
+                name: { type: string, default: "", description: Pusta → część lokalna adresu e-mail. }
+      responses:
+        "201": { $ref: "#/components/responses/Operator" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/v1/settings/operators/{operator_id}/resend:
+    parameters: [{ $ref: "#/components/parameters/OperatorId" }]
+    post:
+      tags: [Settings]
+      summary: Ponów zaproszenie (status `invited`)
+      operationId: resendOperatorInvite
+      responses:
+        "200": { $ref: "#/components/responses/Operator" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/v1/settings/operators/{operator_id}/disable:
+    parameters: [{ $ref: "#/components/parameters/OperatorId" }]
+    post:
+      tags: [Settings]
+      summary: Wyłącz operatora (nie dotyczy `owner`)
+      operationId: disableOperator
+      responses:
+        "200": { $ref: "#/components/responses/Operator" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/v1/settings/operators/{operator_id}/enable:
+    parameters: [{ $ref: "#/components/parameters/OperatorId" }]
+    post:
+      tags: [Settings]
+      summary: Włącz operatora
+      operationId: enableOperator
+      responses:
+        "200": { $ref: "#/components/responses/Operator" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/v1/me:
+    get:
+      tags: [Profile]
+      summary: Profil zalogowanego operatora
+      operationId: getMe
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Profile" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/v1/specialists:
+    get:
+      tags: [Specialists]
+      summary: Modele ML (specjaliści)
+      description: Pusta lista do czasu wpięcia modeli (`MlScorer.describe`).
+      operationId: listSpecialists
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, nextCursor]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/Specialist" } }
+                  nextCursor: { type: "null" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/v1/specialists/{specialist_id}:
+    parameters:
+      - { name: specialist_id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [Specialists]
+      summary: Szczegóły specjalisty
+      operationId: getSpecialist
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Specialist" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/simulator/{path}:
+    parameters:
+      - { name: path, in: path, required: true, schema: { type: string } }
+    get: &simulator
+      tags: [Simulator]
+      summary: Simulator (poza MVP)
+      responses:
+        "501": { $ref: "#/components/responses/NotImplemented" }
+    post: *simulator
+    put: *simulator
+    patch: *simulator
+    delete: *simulator
+
+security:
+  - operatorJwt: []
+
+components:
+  securitySchemes:
+    agentKey:
+      type: http
+      scheme: bearer
+      bearerFormat: ak_<key_id>_<secret>
+      description: Klucz agenta (`python -m app.cli create-key <agent_id>` lub `POST /api/v1/agents/{id}/keys`).
+    operatorJwt:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        JWT z Supabase Auth (HS256 z `SUPABASE_JWT_SECRET` albo RS256/ES256/EdDSA przez JWKS).
+        Lokalnie przy `ADMIN_AUTH_DISABLED=true` nagłówek jest zbędny; operatora można wskazać przez `X-Dev-Operator: <email>`.
+
+  headers:
+    X-Decision-Id:
+      description: Identyfikator decyzji w audycie.
+      schema: { type: string, example: dec_8b1e4f0a9c2d3e4f5a6b }
+    Retry-After:
+      description: Sekundy do ponowienia.
+      schema: { type: integer }
+
+  parameters:
+    SessionIdRequired:
+      name: X-Session-Id
+      in: header
+      required: true
+      description: Sesja z `POST /v1/sessions`, przypięta do agenta.
+      schema: { type: string }
+    SessionIdOptional:
+      name: X-Session-Id
+      in: header
+      required: false
+      description: Gdy podane — hopy i sygnały trafiają do stanu sesji.
+      schema: { type: string }
+    AgentId:
+      { name: agent_id, in: path, required: true, schema: { type: string, example: purchasing-agent } }
+    ApprovalId:
+      { name: approval_id, in: path, required: true, schema: { type: string } }
+    RoleId:
+      { name: role_id, in: path, required: true, schema: { type: string } }
+    ServerId:
+      name: server_id
+      in: path
+      required: true
+      description: Id aplikacji z `proxy.apps`.
+      schema: { type: string }
+    OperatorId:
+      { name: operator_id, in: path, required: true, schema: { type: string } }
+    Search:
+      { name: search, in: query, schema: { type: string } }
+    SortDir:
+      name: sort_dir
+      in: query
+      schema: { type: string, enum: [asc, desc], default: desc }
+    Limit50:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+    Cursor:
+      name: cursor
+      in: query
+      description: Nieprzezroczysty kursor z `nextCursor` (keyset).
+      schema: { type: string }
+    OffsetCursor:
+      name: cursor
+      in: query
+      description: Kursor z `nextCursor` (offset jako string).
+      schema: { type: string }
+    Range:
+      name: range
+      in: query
+      description: Preset okna. Domyślnie `today`; pomiń i podaj `from` + `to` dla zakresu własnego (max 90 dni).
+      schema: { type: string, enum: [today, 24h, 7d, 30d] }
+    From:
+      name: from
+      in: query
+      description: ISO 8601 ze strefą czasową.
+      schema: { type: string, format: date-time }
+    To:
+      name: to
+      in: query
+      description: ISO 8601 ze strefą czasową, wyłącznie.
+      schema: { type: string, format: date-time }
+    Tz:
+      name: tz
+      in: query
+      description: Strefa IANA; domyślnie ze snapshotu ustawień.
+      schema: { type: string, example: Europe/Warsaw }
+    Bucket:
+      name: bucket
+      in: query
+      description: Domyślnie dobierany do okna.
+      schema: { type: string, enum: [5m, 15m, 1h, 1d] }
+    TopLimit:
+      name: top_limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 50, default: 5 }
+
+  responses:
+    # --- agent
+    AgentUnauthorized:
+      description: "`missing_agent_key`, `invalid_agent_key`"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/AgentError" }
+    AgentForbidden:
+      description: "`agent_disabled`"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/AgentError" }
+    RequestTooLarge:
+      description: "`request_too_large` — body powyżej `MAX_REQUEST_BYTES`"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/AgentError" }
+    UpstreamError:
+      description: "`upstream_unavailable`, `upstream_response_too_large` (502), `upstream_timeout` (504)"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/AgentError" }
+    # --- admin
+    BadRequest:
+      description: Błędne dane wejściowe
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/AdminError" }
+    Unauthorized:
+      description: Brak / niepoprawny JWT
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/AdminError" }
+    Forbidden:
+      description: Operator wyłączony lub bez uprawnień
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/AdminError" }
+    NotFound:
+      description: Nie znaleziono
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/AdminError" }
+    Conflict:
+      description: Konflikt stanu
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/AdminError" }
+    NotImplemented:
+      description: Poza MVP
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/AdminError" }
+    Agent:
+      description: OK
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Agent" }
+    Rule:
+      description: OK
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Rule" }
+    Quota:
+      description: OK
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Quota" }
+    ApprovalResolution:
+      description: Rozstrzygnięte
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [id, decision, mode]
+            properties:
+              id: { type: string }
+              decision: { type: string, enum: [allow, deny] }
+              mode: { type: string, enum: [once, deny, temporary] }
+    Role:
+      description: OK
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Role" }
+    Server:
+      description: OK
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Server" }
+    PolicyPack:
+      description: OK
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/PolicyPack" }
+    Workspace:
+      description: OK
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Workspace" }
+    Operator:
+      description: OK
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Operator" }
+
+  schemas:
+    # ------------------------------------------------------------ errors
+    AgentError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [type, code, message]
+          properties:
+            type:
+              type: string
+              enum: [authentication_error, permission_error, session_error, not_found, invalid_request_error, upstream_error, policy_error]
+            code: { type: string, example: invalid_agent_key }
+            message: { type: string }
+    AdminError:
+      type: object
+      required: [detail]
+      properties:
+        detail: { type: string, example: Unknown agent }
+    ValidationErrorList:
+      type: object
+      required: [detail]
+      properties:
+        detail: { type: array, items: { type: object, additionalProperties: true } }
+    NextCursor:
+      type: [string, "null"]
+      description: "`null` = ostatnia strona."
+
+    # ------------------------------------------------------------ agent decisions (D10)
+    DecisionStatus:
+      type: string
+      enum: [blocked, invalid_arguments, pending_approval, rate_limited, session_terminated]
+    DecisionResponse:
+      type: object
+      description: Odpowiedź decyzji dla agenta — bez uzasadnień.
+      required: [status, decision_id, message, error]
+      properties:
+        status: { $ref: "#/components/schemas/DecisionStatus" }
+        decision_id: { type: string }
+        message: { type: string, example: Action blocked by policy }
+        error:
+          type: object
+          required: [type, code, message]
+          properties:
+            type: { type: string, const: policy_error }
+            code: { $ref: "#/components/schemas/DecisionStatus" }
+            message: { type: string }
+    DecisionPendingApproval:
+      allOf:
+        - $ref: "#/components/schemas/DecisionResponse"
+        - type: object
+          required: [approval_id, poll_url, expires_at]
+          properties:
+            status: { const: pending_approval }
+            approval_id: { type: string }
+            poll_url: { type: string, example: "/v1/approvals/apr_1234?wait=30" }
+            expires_at: { type: string, format: date-time }
+    DecisionRateLimited:
+      allOf:
+        - $ref: "#/components/schemas/DecisionResponse"
+        - type: object
+          required: [retry_after_seconds]
+          properties:
+            status: { const: rate_limited }
+            retry_after_seconds: { type: integer, minimum: 1 }
+
+    ApprovalPending:
+      type: object
+      required: [status, decision_id, approval_id, poll_url]
+      properties:
+        status: { type: string, const: pending_approval }
+        decision_id: { type: string }
+        approval_id: { type: string }
+        poll_url: { type: string }
+        expires_at: { type: string, format: date-time, description: Brak, gdy zatwierdzone i trwa wykonanie. }
+    ApprovalApproved:
+      type: object
+      required: [status, decision_id, approval_id, result]
+      properties:
+        status: { type: string, const: approved }
+        decision_id: { type: string }
+        approval_id: { type: string }
+        result: { $ref: "#/components/schemas/ExecutionResult" }
+    ApprovalRejected:
+      type: object
+      required: [status, decision_id, approval_id, feedback]
+      properties:
+        status: { type: string, const: rejected }
+        decision_id: { type: string }
+        approval_id: { type: string }
+        feedback: { type: string, description: Uzasadnienie operatora (może być puste). }
+    ApprovalExpired:
+      type: object
+      required: [status, decision_id, approval_id]
+      properties:
+        status: { type: string, const: expired }
+        decision_id: { type: string }
+        approval_id: { type: string }
+    ExecutionResult:
+      type: object
+      description: Wynik jednokrotnego wykonania zatwierdzonego requestu.
+      required: [status_code]
+      properties:
+        status_code: { type: integer }
+        body: { description: Body upstreamu (JSON lub tekst). }
+        error:
+          type: string
+          enum: [request_tampered, action_no_longer_configured, upstream_timeout, upstream_unavailable, upstream_response_too_large]
+        message: { type: string }
+
+    # ------------------------------------------------------------ enums
+    AgentStatus: { type: string, enum: [active, disabled, revoked] }
+    SessionStatus: { type: string, enum: [active, closed, terminated, expired] }
+    ApprovalStatus: { type: string, enum: [pending, approved, rejected, expired] }
+    RoleStatus: { type: string, enum: [draft, active, archived] }
+    ToolKind: { type: string, enum: [read, write] }
+    ServerHealth: { type: string, enum: [healthy, degraded, down, pending] }
+    UiDecision:
+      type: string
+      description: "`caution` = proxy `escalate`."
+      enum: [allow, caution, deny, rate_limited]
+    ActionStatus:
+      type: string
+      enum: [forwarded, executed, upstream_error, blocked, rate_limited, pending_approval, approved, rejected, expired, session_terminated, invalid]
+
+    ChainStep:
+      type: object
+      required: [stage, outcome, detail]
+      properties:
+        stage: { type: string, enum: [rbac, rules, specialist, human] }
+        outcome: { type: string }
+        detail: { type: string }
+    Reason:
+      type: object
+      required: [code, severity]
+      properties:
+        code: { type: string }
+        severity: { type: string, enum: [deny, escalate] }
+        message: { type: string }
+        source: { type: string, default: policy }
+
+    # ------------------------------------------------------------ overview
+    Window:
+      type: object
+      required: [preset, start, end, previousStart, previousEnd, timezone, bucket, compareLabel]
+      properties:
+        preset: { type: string, enum: [today, 24h, 7d, 30d, custom] }
+        start: { type: string, format: date-time }
+        end: { type: string, format: date-time }
+        previousStart: { type: string, format: date-time }
+        previousEnd: { type: string, format: date-time }
+        timezone: { type: string }
+        bucket: { type: string, enum: [5m, 15m, 1h, 1d] }
+        compareLabel: { type: string, example: vs yesterday }
+    WindowMetrics:
+      type: object
+      required: [window, calls, callsDeltaPct, denyRatePct, cautionRatePct, rateLimited, decisionSplit, callsOverTime, topTools, pendingApprovals]
+      properties:
+        window: { $ref: "#/components/schemas/Window" }
+        calls: { type: integer }
+        callsDeltaPct: { type: [integer, "null"], description: "`null` gdy w poprzednim okresie nie było wywołań." }
+        denyRatePct: { type: integer }
+        cautionRatePct: { type: integer }
+        rateLimited: { type: integer }
+        decisionSplit:
+          type: array
+          items:
+            type: object
+            required: [decision, count]
+            properties:
+              decision: { $ref: "#/components/schemas/UiDecision" }
+              count: { type: integer }
+        callsOverTime:
+          type: array
+          items:
+            type: object
+            required: [start, end, count]
+            properties:
+              start: { type: string, format: date-time }
+              end: { type: string, format: date-time }
+              count: { type: integer }
+        topTools:
+          type: array
+          items:
+            type: object
+            required: [tool, count]
+            properties:
+              tool: { type: string }
+              count: { type: integer }
+        pendingApprovals: { type: integer }
+    QuotaUsage:
+      type: object
+      required: [id, agentId, label, used, cap, unit]
+      properties:
+        id: { type: string }
+        agentId: { type: string }
+        label: { type: string, example: Purchasing Agent · Daily calls }
+        used: { type: integer }
+        cap: { type: integer }
+        unit: { type: string, const: calls }
+    Overview:
+      allOf:
+        - $ref: "#/components/schemas/WindowMetrics"
+        - type: object
+          required: [activeAgents, agentSplit, topAgents, budgets]
+          properties:
+            activeAgents: { type: integer }
+            agentSplit:
+              type: array
+              items:
+                type: object
+                required: [agentId, agentName, clear, flagged]
+                properties:
+                  agentId: { type: string }
+                  agentName: { type: string }
+                  clear: { type: integer }
+                  flagged: { type: integer }
+            topAgents:
+              type: array
+              items:
+                type: object
+                required: [agentId, agentName, count]
+                properties:
+                  agentId: { type: string }
+                  agentName: { type: string }
+                  count: { type: integer }
+            budgets: { type: array, items: { $ref: "#/components/schemas/QuotaUsage" } }
+    AgentOverview:
+      allOf:
+        - $ref: "#/components/schemas/WindowMetrics"
+        - type: object
+          required: [clear, flagged, clearToday, cautionToday, budget]
+          properties:
+            clear: { type: integer }
+            flagged: { type: integer, description: caution + deny }
+            clearToday: { type: integer, description: Alias `clear` (kompatybilność UI). }
+            cautionToday: { type: integer, description: Alias `flagged` (kompatybilność UI). }
+            budget:
+              oneOf:
+                - $ref: "#/components/schemas/QuotaUsage"
+                - type: "null"
+              description: Kwota dzienna, a gdy jej brak — pierwsza aktywna.
+
+    # ------------------------------------------------------------ agents
+    Agent:
+      type: object
+      required: [id, name, roleId, roleName, status, apiKeyHint, mcpServerIds, createdAt, lastSeenAt, mandate, llmModels, rateLimitOverride, limits]
+      properties:
+        id: { type: string, example: purchasing-agent }
+        name: { type: string }
+        roleId: { type: [string, "null"] }
+        roleName: { type: [string, "null"] }
+        status: { $ref: "#/components/schemas/AgentStatus" }
+        apiKeyHint: { type: string, example: "ak_1a2b3c4d_••••x9Yz" }
+        mcpServerIds: { type: array, items: { type: string }, description: Aplikacje, do których agent ma jakikolwiek grant. }
+        createdAt: { type: string, format: date-time }
+        lastSeenAt: { type: [string, "null"], format: date-time }
+        mandate: { type: string }
+        llmModels: { type: array, items: { type: string }, description: Pusta = dowolny model. }
+        rateLimitOverride: { type: [integer, "null"], description: "`limits.requests_per_minute`" }
+        limits:
+          type: object
+          additionalProperties: { type: integer }
+          example: { requests_per_minute: 60, max_denies_per_session: 3 }
+    AgentWithKey:
+      allOf:
+        - $ref: "#/components/schemas/Agent"
+        - type: object
+          required: [apiKey]
+          properties:
+            apiKey: { type: string, description: Pełny klucz — pokazywany tylko raz., example: ak_1a2b3c4d_secret }
+    AgentPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items: { type: array, items: { $ref: "#/components/schemas/Agent" } }
+        nextCursor: { $ref: "#/components/schemas/NextCursor" }
+    AgentCreate:
+      type: object
+      required: [id, name, mandate]
+      properties:
+        id: { type: string, pattern: "^[a-z0-9][a-z0-9-]{1,62}$" }
+        name: { type: string, minLength: 1, maxLength: 200 }
+        mandate: { type: string, minLength: 1, maxLength: 4000 }
+        roleId: { type: [string, "null"] }
+        llmModels: { type: array, items: { type: string }, default: [] }
+        limits: { type: object, additionalProperties: { type: integer }, default: {} }
+    AgentPatch:
+      type: object
+      additionalProperties: false
+      description: Pola pominięte zostają bez zmian. `rateLimitOverride` = `null` usuwa override; `roleId` = `null` odpina rolę.
+      properties:
+        roleId: { type: [string, "null"] }
+        name: { type: [string, "null"], minLength: 1, maxLength: 200 }
+        status: { type: [string, "null"], enum: [active, disabled, null] }
+        mandate: { type: [string, "null"], minLength: 1, maxLength: 4000 }
+        llmModels: { type: [array, "null"], items: { type: string } }
+        rateLimitOverride: { type: [integer, "null"], minimum: 1 }
+    EffectiveTool:
+      type: object
+      required: [serverId, serverName, tool, via]
+      properties:
+        serverId: { type: string }
+        serverName: { type: string }
+        tool: { type: string, example: marketplace.place_order }
+        via: { type: string, enum: [server, tool] }
+    AgentPosture:
+      type: object
+      required: [role, callable, unreachable, attachedWithoutGrants]
+      properties:
+        role:
+          oneOf:
+            - $ref: "#/components/schemas/Role"
+            - type: "null"
+        callable: { type: array, items: { $ref: "#/components/schemas/EffectiveTool" } }
+        unreachable: { type: array, items: {}, maxItems: 0 }
+        attachedWithoutGrants: { type: array, items: { type: string } }
+
+    # ------------------------------------------------------------ rules
+    ConditionNode:
+      description: Drzewo warunków (max głębokość 8). Węzeł grupy albo liść.
+      oneOf:
+        - type: object
+          required: [combinator]
+          properties:
+            combinator: { type: string, enum: [and, or] }
+            children: { type: array, items: { $ref: "#/components/schemas/ConditionNode" } }
+        - type: object
+          required: [field, op]
+          properties:
+            field: { type: string, description: "Szukane w args → request → fakty; kropka = zagnieżdżenie." }
+            op: { type: string, enum: [eq, neq, gt, gte, lt, lte, in, not_in, is_empty, not_empty] }
+            value: { description: "Lista dla `in` / `not_in`." }
+    RuleOutcome: { type: string, enum: [allow, deny, needs_ai] }
+    RuleBody:
+      type: object
+      required: [name, tool, then]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 200 }
+        tool: { type: string, minLength: 1, maxLength: 200, description: "Kwalifikowana nazwa toola; dopuszczalne wzorce glob." }
+        when:
+          $ref: "#/components/schemas/ConditionNode"
+          default: { combinator: and, children: [] }
+        then: { $ref: "#/components/schemas/RuleOutcome" }
+        enabled: { type: boolean, default: true }
+        position: { type: [integer, "null"] }
+    Rule:
+      type: object
+      required: [id, name, agentId, tool, when, then, enabled, position, updatedAt]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        agentId: { type: string }
+        tool: { type: string }
+        when: { $ref: "#/components/schemas/ConditionNode" }
+        then: { $ref: "#/components/schemas/RuleOutcome" }
+        enabled: { type: boolean }
+        position: { type: integer }
+        updatedAt: { type: string, format: date-time }
+    RulesMeta:
+      type: object
+      required: [tools, fields, dryRunSamples]
+      properties:
+        tools:
+          type: array
+          items:
+            type: object
+            required: [serverId, serverName, tools]
+            properties:
+              serverId: { type: string }
+              serverName: { type: string }
+              tools: { type: array, items: { type: string } }
+        fields:
+          type: array
+          items:
+            type: object
+            required: [id, label, type, tools]
+            properties:
+              id: { type: string }
+              label: { type: string }
+              type: { type: string, enum: [number, enum, text] }
+              values: { type: array, items: {} }
+              tools: { type: array, items: { type: string }, description: "`[\"*\"]` dla faktów liczonych." }
+              computed: { type: boolean }
+        dryRunSamples:
+          type: array
+          items:
+            type: object
+            required: [id, label, tool, args]
+            properties:
+              id: { type: string }
+              label: { type: string }
+              tool: { type: string }
+              args: { type: object, additionalProperties: true }
+    DryRunBody:
+      type: object
+      required: [tool]
+      properties:
+        tool: { type: string }
+        args: { type: object, additionalProperties: true, default: {} }
+        rules:
+          type: [array, "null"]
+          items:
+            allOf:
+              - $ref: "#/components/schemas/RuleBody"
+              - type: object
+                properties:
+                  id: { type: string }
+        sessionState: { type: object, additionalProperties: true, default: {} }
+        enrichment: { type: object, additionalProperties: true, default: {} }
+    DryRunResult:
+      type: object
+      required: [matchedRuleId, outcome, detail]
+      properties:
+        matchedRuleId: { type: [string, "null"] }
+        outcome: { oneOf: [{ $ref: "#/components/schemas/RuleOutcome" }, { type: "null" }] }
+        detail: { type: string }
+        policy:
+          type: object
+          required: [verdict, reasons, facts]
+          properties:
+            verdict: { type: string, enum: [allow, deny, escalate] }
+            reasons: { type: array, items: { $ref: "#/components/schemas/Reason" } }
+            facts: { type: object, additionalProperties: true }
+
+    # ------------------------------------------------------------ quotas
+    Quota:
+      type: object
+      required: [id, name, agentId, agentName, window, cap, used, unit, enabled, burst, updatedAt]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        agentId: { type: string }
+        agentName: { type: string }
+        window: { type: string, enum: [1m, 1h, 1d] }
+        cap: { type: integer }
+        used: { type: integer }
+        unit: { type: string, const: calls }
+        enabled: { type: boolean }
+        burst: { type: integer }
+        updatedAt: { type: string, format: date-time }
+    QuotaCreate:
+      type: object
+      required: [name, window, cap]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 200 }
+        window: { type: string, enum: [1m, 1h, 1d] }
+        cap: { type: integer, minimum: 1 }
+        burst: { type: integer, minimum: 0, default: 0 }
+    QuotaPatch:
+      type: object
+      properties:
+        enabled: { type: [boolean, "null"] }
+        name: { type: [string, "null"], minLength: 1, maxLength: 200 }
+        cap: { type: [integer, "null"], minimum: 1 }
+        burst: { type: [integer, "null"], minimum: 0 }
+
+    # ------------------------------------------------------------ approvals
+    Approval:
+      type: object
+      required: [id, tool, agentId, agentName, specialist, allowProb, denyProb, ageSeconds, ttlSeconds, matchedRules, modelChoice, argsRedacted, createdAt, expiresAt, status, decisionId, sessionId, decisionChain]
+      properties:
+        id: { type: string }
+        tool: { type: string }
+        agentId: { type: string }
+        agentName: { type: string }
+        specialist: { type: string, example: rules/v0 }
+        allowProb: { type: number }
+        denyProb: { type: number }
+        ageSeconds: { type: integer }
+        ttlSeconds: { type: integer }
+        matchedRules: { type: array, items: { type: string } }
+        modelChoice: { type: string, example: caution → human }
+        argsRedacted: { type: object, additionalProperties: true }
+        createdAt: { type: string, format: date-time }
+        expiresAt: { type: string, format: date-time }
+        status: { $ref: "#/components/schemas/ApprovalStatus" }
+        decisionId: { type: string }
+        sessionId: { type: string }
+        decisionChain: { type: array, items: { $ref: "#/components/schemas/ChainStep" } }
+
+    # ------------------------------------------------------------ audit
+    AuditEvent:
+      type: object
+      required: [id, timestamp, tool, agentId, agentName, decision, decisionChain, argsRedacted, sessionId, approvalId, actionStatus, httpStatus, degraded]
+      properties:
+        id: { type: string }
+        timestamp: { type: string, format: date-time }
+        tool: { type: string }
+        agentId: { type: string }
+        agentName: { type: string }
+        decision: { $ref: "#/components/schemas/UiDecision" }
+        decisionChain: { type: array, items: { $ref: "#/components/schemas/ChainStep" } }
+        argsRedacted: { type: object, additionalProperties: true }
+        sessionId: { type: [string, "null"] }
+        approvalId: { type: [string, "null"] }
+        actionStatus: { oneOf: [{ $ref: "#/components/schemas/ActionStatus" }, { type: "null" }] }
+        httpStatus: { type: [integer, "null"] }
+        degraded: { type: boolean }
+        quotaId: { type: string, description: Tylko dla `rate_limited`. }
+        retryAfterSeconds: { type: [integer, "null"], description: Tylko dla `rate_limited`. }
+    AuditEventDetail:
+      allOf:
+        - $ref: "#/components/schemas/AuditEvent"
+        - type: object
+          required: [reasons, signals, facts, enrichment, confidence, configRevision, latencyMs, kind, app, requestId, upstreamStatus, approvalStatus]
+          properties:
+            reasons: { type: array, items: { $ref: "#/components/schemas/Reason" } }
+            signals: { type: object, additionalProperties: true }
+            facts: { type: object, additionalProperties: true }
+            enrichment: { type: object, additionalProperties: true }
+            confidence: { type: number }
+            configRevision: { type: integer }
+            latencyMs: { type: number }
+            kind: { $ref: "#/components/schemas/ToolKind" }
+            app: { type: string }
+            requestId: { type: [string, "null"] }
+            upstreamStatus: { type: [integer, "null"] }
+            approvalStatus: { oneOf: [{ $ref: "#/components/schemas/ApprovalStatus" }, { type: "null" }] }
+
+    # ------------------------------------------------------------ sessions
+    Session:
+      type: object
+      required: [id, agentId, agentName, task, status, denyCount, terminationReason, createdAt, lastActivityAt, closedAt, decisions, pendingApprovals]
+      properties:
+        id: { type: string }
+        agentId: { type: string }
+        agentName: { type: string }
+        task: { type: [string, "null"] }
+        status: { $ref: "#/components/schemas/SessionStatus" }
+        denyCount: { type: integer }
+        terminationReason: { type: [string, "null"] }
+        createdAt: { type: string, format: date-time }
+        lastActivityAt: { type: string, format: date-time }
+        closedAt: { type: [string, "null"], format: date-time }
+        decisions: { type: integer }
+        pendingApprovals: { type: integer }
+    TimelineEntry:
+      type: object
+      required: [hopId, seq, timestamp, direction, protocol, app, tool, method, path, upstreamStatus, upstreamLatencyMs, payload]
+      properties:
+        hopId: { type: string }
+        seq: { type: integer }
+        timestamp: { type: string, format: date-time }
+        direction: { type: string, enum: [request, response] }
+        protocol: { type: string, enum: [rest, llm, mcp] }
+        app: { type: string }
+        tool: { type: [string, "null"] }
+        method: { type: [string, "null"] }
+        path: { type: [string, "null"] }
+        upstreamStatus: { type: [integer, "null"] }
+        upstreamLatencyMs: { type: [number, "null"] }
+        payload: { type: object, additionalProperties: true }
+        decision:
+          type: object
+          description: Tylko dla hopów request, dla których zapadła decyzja.
+          required: [id, decision, confidence, reasons, decisionChain, actionStatus, degraded, approvalId, approvalStatus, feedback, resolvedBy]
+          properties:
+            id: { type: string }
+            decision: { $ref: "#/components/schemas/UiDecision" }
+            confidence: { type: number }
+            reasons: { type: array, items: { $ref: "#/components/schemas/Reason" } }
+            decisionChain: { type: array, items: { $ref: "#/components/schemas/ChainStep" } }
+            actionStatus: { oneOf: [{ $ref: "#/components/schemas/ActionStatus" }, { type: "null" }] }
+            degraded: { type: boolean }
+            approvalId: { type: [string, "null"] }
+            approvalStatus: { oneOf: [{ $ref: "#/components/schemas/ApprovalStatus" }, { type: "null" }] }
+            feedback: { type: [string, "null"] }
+            resolvedBy: { type: [string, "null"] }
+    SessionDetail:
+      allOf:
+        - $ref: "#/components/schemas/Session"
+        - type: object
+          required: [state, timeline]
+          properties:
+            state:
+              type: object
+              additionalProperties: true
+              description: Stan sesji (capture, `signals`, `llm_tool_calls`).
+            timeline: { type: array, items: { $ref: "#/components/schemas/TimelineEntry" } }
+
+    # ------------------------------------------------------------ roles
+    RoleGrant:
+      type: object
+      required: [serverId, serverName, serverWide, tools]
+      properties:
+        serverId: { type: string }
+        serverName: { type: string }
+        serverWide: { type: boolean }
+        tools:
+          type: object
+          additionalProperties: { type: boolean }
+          example: { warehouse.low_stock: true, warehouse.adjust_stock: false }
+    GrantInput:
+      type: object
+      required: [serverId]
+      properties:
+        serverId: { type: string }
+        serverWide: { type: boolean, default: false }
+        tools:
+          type: object
+          additionalProperties: { type: boolean }
+          default: {}
+          description: Nazwy toola z prefiksem aplikacji lub bez. Zaznaczenie wszystkich = grant na całą aplikację.
+    AgentRef:
+      type: object
+      required: [id, name]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        status: { $ref: "#/components/schemas/AgentStatus" }
+    Role:
+      type: object
+      required: [id, name, description, status, grants, createdAt, updatedAt, assignedAgents, effectiveTools]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        description: { type: string }
+        status: { $ref: "#/components/schemas/RoleStatus" }
+        grants: { type: array, items: { $ref: "#/components/schemas/RoleGrant" } }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        assignedAgents: { type: array, items: { $ref: "#/components/schemas/AgentRef" } }
+        effectiveTools: { type: array, items: { $ref: "#/components/schemas/EffectiveTool" } }
+    RoleSummary:
+      type: object
+      required: [id, name, description, status, grantedToolCount, assignedAgentIds, assignedAgents, createdAt, updatedAt]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        description: { type: string }
+        status: { $ref: "#/components/schemas/RoleStatus" }
+        grantedToolCount: { type: integer }
+        assignedAgentIds: { type: array, items: { type: string } }
+        assignedAgents: { type: array, items: { $ref: "#/components/schemas/AgentRef" } }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+    RoleCreate:
+      type: object
+      required: [name]
+      properties:
+        id: { type: [string, "null"], pattern: "^[a-z0-9][a-z0-9_-]{1,62}$" }
+        name: { type: string, minLength: 1, maxLength: 120 }
+        description: { type: string, default: "" }
+        grants: { type: array, items: { $ref: "#/components/schemas/GrantInput" }, default: [] }
+    RolePatch:
+      type: object
+      properties:
+        name: { type: [string, "null"], minLength: 1, maxLength: 120 }
+        description: { type: [string, "null"] }
+        grants: { type: [array, "null"], items: { $ref: "#/components/schemas/GrantInput" } }
+
+    # ------------------------------------------------------------ MCP registry
+    Server:
+      type: object
+      required: [id, name, kind, protocol, url, health, toolCount, tools, toolDetails, lastSyncAt, requiresAuth, description, enabled, hasPolicyPack]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        kind: { type: string, const: remote }
+        protocol: { type: string, enum: [rest, mcp] }
+        url: { type: string }
+        health: { $ref: "#/components/schemas/ServerHealth" }
+        toolCount: { type: integer, description: Liczba włączonych tooli. }
+        tools: { type: array, items: { type: string }, description: Włączone toole. }
+        toolDetails:
+          type: array
+          items:
+            type: object
+            required: [name, kind, method, path, description, enabled]
+            properties:
+              name: { type: string }
+              kind: { $ref: "#/components/schemas/ToolKind" }
+              method: { type: [string, "null"] }
+              path: { type: [string, "null"], description: Ścieżka HTTP albo nazwa toola MCP. }
+              description: { type: [string, "null"] }
+              enabled: { type: boolean }
+        lastSyncAt: { type: string, format: date-time }
+        requiresAuth: { type: boolean }
+        description: { type: string }
+        enabled: { type: boolean }
+        hasPolicyPack: { type: boolean }
+
+    # ------------------------------------------------------------ policies
+    PolicyPack:
+      type: object
+      required: [appId, cedarPolicies, cedarSchema, params, paramsSchema, overrides, rules, effectiveParams, updatedAt]
+      properties:
+        appId: { type: string }
+        cedarPolicies: { type: string }
+        cedarSchema: { type: string }
+        params: { type: object, additionalProperties: true }
+        paramsSchema: { type: object, additionalProperties: true }
+        overrides:
+          type: object
+          description: agent_id → parametry override.
+          additionalProperties: { type: object, additionalProperties: true }
+        rules:
+          type: array
+          description: Adnotacje reguł `forbid` z pakietu.
+          items:
+            type: object
+            additionalProperties: true
+            properties:
+              id: { type: string }
+              severity: { type: string, enum: [deny, escalate] }
+              message: { type: [string, "null"] }
+        effectiveParams:
+          type: object
+          description: agent_id → parametry po złożeniu z override.
+          additionalProperties: { type: object, additionalProperties: true }
+        updatedAt: { type: string, format: date-time }
+
+    # ------------------------------------------------------------ settings / profile
+    Workspace:
+      type: object
+      required: [orgName, defaultApprovalTtlSeconds, specialistFailClosed, auditRetentionDays, authMode]
+      properties:
+        orgName: { type: string }
+        defaultApprovalTtlSeconds: { type: integer, enum: [300, 900, 1800, 3600] }
+        specialistFailClosed: { type: boolean }
+        auditRetentionDays: { type: integer, enum: [30, 90, 180, 365] }
+        authMode: { type: string, const: invite_only }
+    Operator:
+      type: object
+      required: [id, email, name, role, status, invitedAt, lastActiveAt]
+      properties:
+        id: { type: string }
+        email: { type: string, format: email }
+        name: { type: string }
+        role: { type: string, enum: [owner, admin, operator, viewer] }
+        status: { type: string, enum: [active, invited, disabled] }
+        invitedAt: { type: [string, "null"], format: date-time }
+        lastActiveAt: { type: [string, "null"], format: date-time }
+    Profile:
+      type: object
+      required: [userId, email, name, avatarUrl, authProvider, lastSignInAt, sessionExpiresAt, operator, workspace]
+      properties:
+        userId: { type: string }
+        email: { type: string }
+        name: { type: string }
+        avatarUrl: { type: [string, "null"] }
+        authProvider: { type: string, example: email }
+        lastSignInAt: { type: "null" }
+        sessionExpiresAt: { type: [string, "null"], format: date-time }
+        operator:
+          oneOf:
+            - $ref: "#/components/schemas/Operator"
+            - type: "null"
+          description: Wpis z rostera; `null`, gdy użytkownika nie ma na liście operatorów.
+        workspace:
+          type: object
+          required: [orgName, authMode]
+          properties:
+            orgName: { type: string }
+            authMode: { type: string, const: invite_only }
+    Specialist:
+      type: object
+      additionalProperties: true
+      required: [id]
+      properties:
+        id: { type: string }

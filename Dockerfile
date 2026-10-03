@@ -13,7 +13,6 @@ RUN pip install -r requirements.txt
 COPY app ./app
 COPY migrations ./migrations
 COPY policies ./policies
-COPY seeds ./seeds
 
 # ALB marketplace (two-backend) ma certyfikat z naszego CA (brak publicznej domeny).
 # Dokładamy go do publicznych CA (certifi), których dalej potrzebuje Supabase i Bedrock.
