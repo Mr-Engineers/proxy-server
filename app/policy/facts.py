@@ -136,6 +136,7 @@ def compute_facts(
         "order_seen_in_session": order_id is not None and str(order_id) in orders_placed,
         "merchant_known": merchant is not None,
         "merchant_id": str((merchant or {}).get("id") or offer_merchant or ""),
+        "merchant_domain_age_days": int(merchant_attrs(merchant).get("domain_age_days") or 0),
     }
     for window, minor in spent.items():
         facts[f"spent_{window}_minor"] = minor

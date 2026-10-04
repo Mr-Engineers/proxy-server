@@ -384,7 +384,9 @@ async def delete_rule(agent_id: str, rule_id: str, request: Request) -> None:
 
 FACT_FIELDS = [
     ("order_value_minor", "number"), ("qty_ratio_pct", "number"), ("quantity", "number"), ("qty_needed", "number"),
-    ("offer_seen_in_session", "enum"), ("sku_needed", "enum"), ("merchant_known", "enum"), ("currency", "text"),
+    ("offer_seen_in_session", "enum"), ("sku_needed", "enum"), ("merchant_known", "enum"),
+    ("merchant_matches", "enum"), ("price_matches", "enum"), ("sku", "text"), ("currency", "text"),
+    ("merchant_id", "text"), ("merchant_domain_age_days", "number"),
 ]
 
 

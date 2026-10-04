@@ -109,6 +109,22 @@ def test_jev_caution_keeps_hitl(make_client, upstreams) -> None:
     assert row["chain"][2]["outcome"] == "caution"
 
 
+def test_jev_clears_ui_needs_ai(make_client, upstreams) -> None:
+    client = make_client(scorer=_mock_jev("clear", confidence=0.9))
+    created = client.post("/api/v1/agents/purchasing-agent/rules", json={
+        "name": "Review warehouse", "tool": "warehouse.*",
+        "when": {"combinator": "and", "children": []}, "then": "needs_ai",
+    })
+    assert created.status_code == 201, created.text
+    reload(client)
+    headers = open_session(client)
+    response = client.get("/apps/warehouse/low-stock", headers=headers)
+    assert response.status_code == 200, response.text
+    row = decision(response.headers["x-decision-id"])
+    assert row["verdict"] == "allow"
+    assert row["chain"][2]["stage"] == "specialist" and row["chain"][2]["outcome"] == "clear"
+
+
 def test_fresh_domain_escalates_and_approve_executes_once(client, upstreams) -> None:
     headers = prepare(client, upstreams, "fresh_domain_discount")
     response = client.post("/apps/marketplace/orders", json=order("off_pr_pap", price="36.00"), headers=headers)

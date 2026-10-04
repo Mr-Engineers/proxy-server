@@ -13,6 +13,7 @@ class SpecialistPack:
     use_case: str
     model_id: str
     criteria_summary: str
+    agent_id: str | None  # bound demo agent for UI specialists card
     agent_match: tuple[str, ...]  # substrings matched against agent_id (lowercase)
     instructions: str
     criteria: dict[str, str]
@@ -24,22 +25,26 @@ PURCHASING = SpecialistPack(
     use_case="purchasing",
     model_id="local/purchasing",
     criteria_summary="Mandate alignment for restock orders: SKU need, qty ratio, merchant risk, session grounding.",
+    agent_id="purchasing-agent",
     agent_match=("purchasing", "shop", "restock", "buy"),
     instructions=(
         "Decide whether this tool call should be auto-allowed for a purchasing/restock agent. "
         "Compare `tool` and `args` to `mandate` and the session evidence in `facts`, `enrichment`, and `session`. "
         "Policy already flagged this call (`policy_reasons`); judge if it is still consistent with the agent's purpose. "
-        "Prefer clear when the purchase restocks a needed SKU at a plausible quantity from a reasonable merchant. "
+        "Prefer clear when the purchase restocks a needed SKU at a plausible quantity from a verified, "
+        "established merchant (domain age comfortable, reputation present). "
         "Prefer deny when the action clearly conflicts with the mandate (wrong purpose, abusive quantity, or ungated spend). "
-        "Prefer caution when evidence is incomplete or the case is borderline."
+        "Prefer caution when evidence is incomplete, the merchant is young/unverified, or the case is borderline — "
+        "especially policy reasons like merchant_too_young or qty_ratio_exceeded."
     ),
     criteria={
         "clear": (
             "Action matches the purchasing mandate and session evidence "
-            "(needed SKU, sensible qty, acceptable merchant); safe to auto-allow."
+            "(needed SKU, sensible qty, verified established merchant); safe to auto-allow."
         ),
         "caution": (
-            "Borderline restock risk or missing evidence; a human should review before the order proceeds."
+            "Borderline restock risk, young/unverified merchant, or missing evidence; "
+            "a human should review before the order proceeds."
         ),
         "deny": (
             "Action conflicts with the purchasing mandate or looks abusive "
@@ -55,6 +60,7 @@ DISPUTE = SpecialistPack(
     use_case="dispute",
     model_id="local/dispute",
     criteria_summary="Mandate alignment for refunds, chargebacks, and billing dispute actions.",
+    agent_id=None,
     agent_match=("dispute", "refund", "chargeback", "billing", "support"),
     instructions=(
         "Decide whether this tool call should be auto-allowed for a dispute/refund support agent. "

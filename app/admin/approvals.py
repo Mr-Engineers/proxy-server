@@ -32,8 +32,23 @@ def matched_rules(reasons: list[dict]) -> list[str]:
     return [reason.get("message") or reason.get("code") for reason in reasons or []]
 
 
+def model_choice_label(signals: dict[str, Any], chain: list[dict] | None) -> str:
+    choice = signals.get("choice")
+    if choice == "clear":
+        return "clear → allow"
+    if choice == "deny":
+        return "deny → block"
+    if choice == "caution":
+        return "caution → human"
+    for step in chain or []:
+        if step.get("stage") == "specialist" and step.get("detail"):
+            return str(step["detail"])
+    return "caution → human"
+
+
 def approval_item(row: Any) -> dict[str, Any]:
     signals = row["signals"] or {}
+    chain = row["chain"] or []
     now = utcnow()
     return {
         "id": row["id"],
@@ -46,14 +61,14 @@ def approval_item(row: Any) -> dict[str, Any]:
         "ageSeconds": max(int((now - row["created_at"]).total_seconds()), 0),
         "ttlSeconds": seconds_until(row["expires_at"]),
         "matchedRules": matched_rules(row["reasons"]),
-        "modelChoice": "caution → human",
+        "modelChoice": model_choice_label(signals, chain),
         "argsRedacted": row["args_redacted"] or {},
         "createdAt": iso(row["created_at"]),
         "expiresAt": iso(row["expires_at"]),
         "status": row["status"],
         "decisionId": row["decision_id"],
         "sessionId": row["session_id"],
-        "decisionChain": row["chain"] or [],
+        "decisionChain": chain,
     }
 
 

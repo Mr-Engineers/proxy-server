@@ -130,12 +130,47 @@ SCENARIOS = [
 
 def _chain(verdict: str, reasons: list[str]) -> list[dict]:
     rules = {"deny": "deny", "escalate": "caution", "rate_limited": "rate_limited"}.get(verdict, "pass")
+    specialist = (
+        {"stage": "specialist", "outcome": "caution", "detail": "caution → human (young merchant / over-qty)"}
+        if verdict == "escalate"
+        else {"stage": "specialist", "outcome": "skipped", "detail": "Not required"}
+    )
     return [
         {"stage": "rbac", "outcome": "deny" if "unknown_route" in reasons else "pass", "detail": "Role role_purchasing_operator"},
         {"stage": "rules", "outcome": rules, "detail": "; ".join(reasons) or "No rule matched"},
-        {"stage": "specialist", "outcome": "caution" if verdict == "escalate" else "skipped", "detail": "No specialist loaded"},
+        specialist,
         {"stage": "human", "outcome": "pending" if verdict == "escalate" else "skipped", "detail": "Waiting for operator" if verdict == "escalate" else "Not required"},
     ]
+
+
+def _signals(verdict: str, reasons: list[str]) -> dict:
+    if verdict != "escalate":
+        return {
+            "available": False,
+            "choice": None,
+            "confidence": None,
+            "allow_prob": 1.0 if verdict == "allow" else 0.0,
+            "deny_prob": 1.0 if verdict == "deny" else 0.0,
+            "specialist": "rules/v0",
+            "version": "v0",
+            "demo": True,
+        }
+    # Demo HITL path: specialist cautioned (same shape as live Jev signals).
+    return {
+        "available": True,
+        "choice": "caution",
+        "confidence": 0.78,
+        "alignment": 0.22,
+        "p_malicious": 0.18,
+        "allow_prob": 0.22,
+        "deny_prob": 0.18,
+        "specialist": "local/purchasing",
+        "version": "jev-latest",
+        "latency_ms": 186.0,
+        "failed": False,
+        "demo": True,
+        "notes": reasons,
+    }
 
 
 async def seed_demo(sessions: int) -> None:
@@ -176,7 +211,7 @@ async def seed_demo(sessions: int) -> None:
                         """,
                         decision_id, hop_id, session_id, verdict, 1.0 if verdict != "escalate" else 0.5,
                         [{"code": code, "severity": "deny" if verdict != "escalate" else "escalate", "message": code, "source": "policy"} for code in reasons],
-                        {"allow_prob": 0.5, "deny_prob": 0.5, "specialist": "rules/v0", "demo": True},
+                        _signals(verdict, reasons),
                         rng.uniform(2, 40), revision, agent_id, tool.partition(".")[0], tool, kind, _chain(verdict, reasons),
                         args, status_for[verdict], http_for[verdict], moment,
                         "quota_purchasing_hourly" if verdict == "rate_limited" else None, 60 if verdict == "rate_limited" else None,

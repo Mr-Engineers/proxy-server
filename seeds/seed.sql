@@ -93,4 +93,40 @@ insert into proxy.quotas (id, agent_id, name, "window", cap, burst)
 values ('quota_purchasing_hourly', 'purchasing-agent', 'Hourly cap', '1h', 500, 50)
 on conflict (id) do nothing;
 
+-- Demo UI rules: route borderline restocks to Jev (needs_ai). Cedar still escalates
+-- young merchants / over-qty; Jev clear may auto-allow, caution → HITL Approvals.
+insert into proxy.agent_rules (id, agent_id, name, tool, condition, outcome, enabled, position)
+values
+  (
+    'rule_purch_over_qty', 'purchasing-agent', 'AI review over-quantity orders',
+    'marketplace.place_order',
+    '{"combinator":"and","children":[{"id":"c_ratio","field":"qty_ratio_pct","op":"gt","value":"100"}]}',
+    'needs_ai', true, 0
+  ),
+  (
+    'rule_purch_sku_not_needed', 'purchasing-agent', 'AI review SKU not on low-stock list',
+    'marketplace.place_order',
+    '{"combinator":"and","children":[{"id":"c_needed","field":"sku_needed","op":"eq","value":false}]}',
+    'needs_ai', true, 1
+  ),
+  (
+    'rule_purch_young_merchant', 'purchasing-agent', 'AI review young-merchant shops',
+    'marketplace.place_order',
+    '{"combinator":"and","children":[{"id":"c_age","field":"merchant_domain_age_days","op":"lt","value":"90"}]}',
+    'needs_ai', true, 2
+  ),
+  (
+    'rule_purch_register_po', 'purchasing-agent', 'AI review purchase-order registration',
+    'warehouse.register_po',
+    '{"combinator":"and","children":[]}',
+    'needs_ai', true, 3
+  )
+on conflict (id) do update set
+  name = excluded.name,
+  tool = excluded.tool,
+  condition = excluded.condition,
+  outcome = excluded.outcome,
+  enabled = excluded.enabled,
+  position = excluded.position;
+
 commit;

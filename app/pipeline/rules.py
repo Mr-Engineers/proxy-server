@@ -79,10 +79,25 @@ def _number(value: Any) -> float | None:
     return None
 
 
+def _as_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        folded = value.strip().casefold()
+        if folded in {"true", "1", "yes"}:
+            return True
+        if folded in {"false", "0", "no"}:
+            return False
+    return None
+
+
 def _equal(left: Any, right: Any) -> bool:
     left_number, right_number = _number(left), _number(right)
     if left_number is not None and right_number is not None:
         return left_number == right_number
+    left_bool, right_bool = _as_bool(left), _as_bool(right)
+    if left_bool is not None and right_bool is not None:
+        return left_bool is right_bool
     if isinstance(left, str) and isinstance(right, str):
         return left.casefold() == right.casefold()
     return left == right
