@@ -32,6 +32,16 @@ def matched_rules(reasons: list[dict]) -> list[str]:
     return [reason.get("message") or reason.get("code") for reason in reasons or []]
 
 
+def _optional_prob(value: Any) -> float | None:
+    """Model probs only when specialist scored; omit invented 50/50 placeholders."""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def model_choice_label(signals: dict[str, Any], chain: list[dict] | None) -> str:
     choice = signals.get("choice")
     if choice == "clear":
@@ -56,8 +66,8 @@ def approval_item(row: Any) -> dict[str, Any]:
         "agentId": row["agent_id"],
         "agentName": row["agent_name"],
         "specialist": signals.get("specialist", "rules/v0"),
-        "allowProb": float(signals.get("allow_prob", 0.5)),
-        "denyProb": float(signals.get("deny_prob", 0.5)),
+        "allowProb": _optional_prob(signals.get("allow_prob")),
+        "denyProb": _optional_prob(signals.get("deny_prob")),
         "ageSeconds": max(int((now - row["created_at"]).total_seconds()), 0),
         "ttlSeconds": seconds_until(row["expires_at"]),
         "matchedRules": matched_rules(row["reasons"]),

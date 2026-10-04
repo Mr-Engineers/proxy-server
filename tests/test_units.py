@@ -163,6 +163,9 @@ def test_aggregator_v0() -> None:
     failed_agg = aggregate("write", policy("allow"), failed, True, False, True)
     assert failed_agg.verdict is Verdict.ESCALATE
     assert "specialist.failed" in {r.code for r in failed_agg.reasons}
+    assert failed_agg.allow_prob is None and failed_agg.deny_prob is None
+    skipped = aggregate("write", policy("allow"), none, True, False, True)
+    assert skipped.allow_prob is None and skipped.deny_prob is None
 
 
 def test_aggregator_with_ml_signals() -> None:
@@ -206,12 +209,40 @@ def test_resolve_use_case_and_describe() -> None:
     assert resolve_use_case("purchasing-agent") == "purchasing"
     assert resolve_use_case("unknown-agent") == "purchasing"
 
-    cards = JevScorer(system_one=None, api_key="test").describe()
+    cards = JevScorer(api_key=None, fallback=True).describe()
     assert {card["id"] for card in cards} == {"spc_jev"}
     assert cards[0]["health"] == "healthy"
     null_cards = NullScorer().describe()
     assert {card["id"] for card in null_cards} == {"spc_jev"}
     assert null_cards[0]["health"] == "unavailable"
+
+
+def test_heuristic_fallback_young_merchant() -> None:
+    import asyncio
+
+    from app.pipeline.jev import JevScorer
+    from app.pipeline.models import Action
+
+    async def run() -> None:
+        scorer = JevScorer(api_key=None, fallback=True, model="jev-latest")
+        agent = AgentConfig(id="purchasing-agent", name="P", status="active", mandate="restock")
+        action = Action(
+            app="marketplace", tool="marketplace.place_order", kind="write",
+            args={"offer_id": "off_pr_pap", "quantity": 47}, session_id="s1", agent_id=agent.id,
+        )
+        signals = await scorer.score(
+            action, agent, {}, {},
+            {"sku_needed": True, "qty_ratio_pct": 100, "merchant_domain_age_days": 30, "offer_seen_in_session": True},
+            policy_reasons=["marketplace.merchant_too_young"],
+        )
+        assert signals.available and not signals.failed
+        assert signals.choice == "caution"
+        assert signals.confidence and signals.confidence >= 0.8
+        assert signals.alignment == 0.16 and signals.p_malicious == 0.14
+        assert signals.specialist == "jev"
+        assert "fallback" in signals.version
+
+    asyncio.run(run())
 
 
 def test_jev_scorer_maps_choice() -> None:

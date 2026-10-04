@@ -161,8 +161,9 @@ class RuntimeStore:
         request_id: str,
     ) -> None:
         signals = dict(decision.signals)
-        signals.setdefault("allow_prob", decision.allow_prob)
-        signals.setdefault("deny_prob", decision.deny_prob)
+        # Persist null when specialist did not score — UI must not invent 50/50.
+        signals["allow_prob"] = decision.allow_prob
+        signals["deny_prob"] = decision.deny_prob
         if decision.facts:
             signals.setdefault("facts", decision.facts)
         await self.pool.execute(

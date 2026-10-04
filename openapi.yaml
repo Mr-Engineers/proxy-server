@@ -2098,8 +2098,8 @@ components:
         agentId: { type: string }
         agentName: { type: string }
         specialist: { type: string, example: rules/v0 }
-        allowProb: { type: number }
-        denyProb: { type: number }
+        allowProb: { type: [number, "null"], description: "Specialist P(clear); null when model was not scored" }
+        denyProb: { type: [number, "null"], description: "Specialist P(deny); null when model was not scored" }
         ageSeconds: { type: integer }
         ttlSeconds: { type: integer }
         matchedRules: { type: array, items: { type: string } }

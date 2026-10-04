@@ -28,8 +28,8 @@ class Aggregate:
     reasons: list[Reason]
     specialist_outcome: str
     specialist_detail: str
-    allow_prob: float
-    deny_prob: float
+    allow_prob: float | None
+    deny_prob: float | None
 
 
 def aggregate(
@@ -43,13 +43,15 @@ def aggregate(
     reasons = list(policy.reasons)
     tau_low, tau_high = TAU.get(kind, TAU["write"])
 
+    # Only emit probs when the specialist actually returned scores — never invent 50/50.
     if signals.available and signals.alignment is not None and signals.p_malicious is not None:
-        allow_prob, deny_prob = round(signals.alignment, 4), round(signals.p_malicious, 4)
+        allow_prob: float | None = round(signals.alignment, 4)
+        deny_prob: float | None = round(signals.p_malicious, 4)
     elif signals.available and signals.p_malicious is not None:
         p = signals.p_malicious
         allow_prob, deny_prob = round(1 - p, 4), round(p, 4)
     else:
-        allow_prob = deny_prob = 0.5
+        allow_prob = deny_prob = None
 
     if policy.verdict == "deny":
         return Aggregate(Verdict.DENY, 1.0, reasons, "skipped", "Hard policy deny", 0.0, 1.0)
@@ -81,28 +83,28 @@ def aggregate(
                 code="specialist.failed", severity="escalate",
                 message=f"Specialist call failed ({signals.specialist})", source="ml",
             ))
-            return Aggregate(Verdict.ESCALATE, 0.5, reasons, "caution", "specialist failed → human", allow_prob, deny_prob)
-        return Aggregate(Verdict.ESCALATE, 0.5, reasons, "caution", "caution → human (policy)", allow_prob, deny_prob)
+            return Aggregate(Verdict.ESCALATE, 0.5, reasons, "caution", "specialist failed → human", None, None)
+        return Aggregate(Verdict.ESCALATE, 0.5, reasons, "caution", "caution → human (policy)", None, None)
     if needs_ai:
         if signals.failed:
             reasons.append(Reason(
                 code="specialist.failed", severity="escalate",
                 message=f"Specialist call failed ({signals.specialist})", source="ml",
             ))
-            return Aggregate(Verdict.ESCALATE, 0.5, reasons, "caution", "specialist failed → human", allow_prob, deny_prob)
+            return Aggregate(Verdict.ESCALATE, 0.5, reasons, "caution", "specialist failed → human", None, None)
         if fail_closed:
             reasons.append(Reason(code="specialist.unavailable", severity="escalate", message="No specialist model loaded", source="ml"))
-            return Aggregate(Verdict.ESCALATE, 0.5, reasons, "caution", "No specialist loaded → human", allow_prob, deny_prob)
-        return Aggregate(Verdict.ALLOW, 0.5, reasons, "skipped", "No specialist loaded, fail-open", allow_prob, deny_prob)
-    return Aggregate(Verdict.ALLOW, 0.8, reasons, "skipped", "No specialist loaded", allow_prob, deny_prob)
+            return Aggregate(Verdict.ESCALATE, 0.5, reasons, "caution", "No specialist loaded → human", None, None)
+        return Aggregate(Verdict.ALLOW, 0.5, reasons, "skipped", "No specialist loaded, fail-open", None, None)
+    return Aggregate(Verdict.ALLOW, 0.8, reasons, "skipped", "No specialist loaded", None, None)
 
 
 def _aggregate_choice(
     kind: str,
     signals: MlSignals,
     reasons: list[Reason],
-    allow_prob: float,
-    deny_prob: float,
+    allow_prob: float | None,
+    deny_prob: float | None,
 ) -> Aggregate:
     choice = signals.choice
     conf = signals.confidence if signals.confidence is not None else 0.0

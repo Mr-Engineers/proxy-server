@@ -36,19 +36,19 @@ logger = logging.getLogger("proxy.http")
 
 
 def default_scorer(settings: Settings) -> MlScorer:
-    """Wire specialists from `specialists.json`; Jev needs TYPESAFE_API_KEY to score."""
+    """Always wire Jev from `specialists.json`. Hosted TypeSafe when keyed; else heuristic fallback."""
     from app.pipeline.jev_packs import load_packs
 
     packs = load_packs()
+    if not any(pack.provider == "typesafe" for pack in packs):
+        return NullScorer()
     key = settings.typesafe_api_key.get_secret_value() if settings.typesafe_api_key else ""
-    uses_typesafe = any(pack.provider == "typesafe" for pack in packs)
-    if uses_typesafe and key.strip():
-        return JevScorer(
-            api_key=key.strip(),
-            model=settings.typesafe_model,
-            timeout_seconds=settings.jev_timeout_seconds,
-        )
-    return NullScorer()
+    return JevScorer(
+        api_key=key.strip() or None,
+        model=settings.typesafe_model,
+        timeout_seconds=settings.jev_timeout_seconds,
+        fallback=True,
+    )
 
 
 def create_app(

@@ -10,6 +10,7 @@ from typing import Any
 from app.config.models import AgentConfig
 from app.pipeline.jev_packs import choice_question, describe_all, pack_for, resolve_use_case
 from app.pipeline.models import Action, MlSignals
+from app.pipeline.specialist_fallback import heuristic_score
 
 logger = logging.getLogger("proxy.jev")
 
@@ -93,15 +94,19 @@ class JevScorer:
         model: str = "jev-latest",
         timeout_seconds: float = 5.0,
         system_one: SystemOneFn | None = None,
+        fallback: bool = True,
     ) -> None:
         self.api_key = api_key
         self.model = model
         self.timeout_seconds = timeout_seconds
+        self.fallback = fallback
         self._system_one = system_one
         self._client: Any = None
 
     async def _ensure_client(self) -> Any:
         if self._system_one is not None:
+            return None
+        if not (self.api_key or "").strip():
             return None
         if self._client is not None:
             return self._client
@@ -127,6 +132,12 @@ class JevScorer:
     ) -> MlSignals:
         use_case = resolve_use_case(agent.id)
         pack = pack_for(use_case)
+        # No hosted client and no inject → deterministic evaluate from pipeline facts.
+        if self._system_one is None and not (self.api_key or "").strip():
+            if self.fallback:
+                return heuristic_score(pack, facts, policy_reasons, version=f"{self.model}+fallback")
+            return MlSignals(failed=True, specialist=pack.model_id, version=self.model)
+
         state = build_state(
             action, agent, session_state, enrichment, facts,
             use_case=use_case, policy_reasons=policy_reasons,
@@ -144,12 +155,22 @@ class JevScorer:
                     "error": type(exc).__name__, "detail": str(exc)[:300], "latency_ms": round(latency_ms, 1),
                 }},
             )
+            if self.fallback:
+                return heuristic_score(
+                    pack, facts, policy_reasons,
+                    version=f"{self.model}+fallback", latency_ms=max(latency_ms, 1.0),
+                )
             return MlSignals(failed=True, specialist=pack.model_id, version=self.model, latency_ms=latency_ms)
 
         latency_ms = (time.perf_counter() - started) * 1000
         answer = _extract_choice(response, "verdict")
         if answer is None:
             logger.error("jev_missing_verdict", extra={"fields": {"tool": action.tool}})
+            if self.fallback:
+                return heuristic_score(
+                    pack, facts, policy_reasons,
+                    version=f"{self.model}+fallback", latency_ms=max(latency_ms, 1.0),
+                )
             return MlSignals(failed=True, specialist=pack.model_id, version=self.model, latency_ms=latency_ms)
 
         choice, probabilities, confidence, model_version = answer
@@ -167,16 +188,20 @@ class JevScorer:
             return await self._system_one(state=state, questions=questions, model=self.model)
 
         client = await self._ensure_client()
+        if client is None:
+            raise RuntimeError("TypeSafe client not configured")
         return await client.system_one(state=state, questions=questions, model=self.model, timeout=self.timeout_seconds)
 
     async def scan(self, texts: list[str]) -> dict[str, float]:
         return {}
 
     def describe(self) -> list[dict[str, Any]]:
+        # Fallback keeps the specialist card available even without TYPESAFE_API_KEY.
+        health = "healthy" if (self.api_key or self._system_one or self.fallback) else "unavailable"
         return describe_all(
             model=self.model,
             latency_budget_ms=int(self.timeout_seconds * 1000),
-            health="healthy" if (self.api_key or self._system_one) else "unavailable",
+            health=health,
         )
 
 

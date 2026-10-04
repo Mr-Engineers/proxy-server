@@ -90,6 +90,6 @@ class Decision(BaseModel):
     approval_id: str | None = None
     quota_id: str | None = None
     retry_after_seconds: int | None = None
-    allow_prob: float = 0.5
-    deny_prob: float = 0.5
+    allow_prob: float | None = None
+    deny_prob: float | None = None
     facts: dict[str, Any] = Field(default_factory=dict)
