@@ -8,3 +8,4 @@ botocore>=1.35.0
 cedarpy>=4.0.0
 pyjwt[crypto]>=2.9.0
 jsonschema>=4.23.0
+typesafe-sdk>=0.1.0

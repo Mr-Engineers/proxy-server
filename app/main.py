@@ -24,6 +24,7 @@ from app.db.dsn import parse_database_url
 from app.hitl.approvals import ApprovalNotifier, ApprovalService, listen
 from app.pipeline.engine import DecisionPipeline
 from app.pipeline.enrichment import HttpEnricher
+from app.pipeline.jev import JevScorer
 from app.pipeline.ml import MlScorer, NullScorer
 from app.store.runtime import RuntimeStore, init_connection
 from app.upstream.auth import Authenticator
@@ -32,6 +33,17 @@ from app.upstream.client import UpstreamClient
 REQUEST_ID_HEADER = "X-Request-Id"
 
 logger = logging.getLogger("proxy.http")
+
+
+def default_scorer(settings: Settings) -> MlScorer:
+    key = settings.typesafe_api_key.get_secret_value() if settings.typesafe_api_key else ""
+    if not key.strip():
+        return NullScorer()
+    return JevScorer(
+        api_key=key.strip(),
+        model=settings.typesafe_model,
+        timeout_seconds=settings.jev_timeout_seconds,
+    )
 
 
 def create_app(
@@ -43,6 +55,7 @@ def create_app(
 ) -> FastAPI:
     settings = settings or get_settings()
     configure_logging(settings.log_level)
+    scorer = scorer if scorer is not None else default_scorer(settings)
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
@@ -111,7 +124,7 @@ def create_app(
             application.state.store = store
             application.state.db = pool
             application.state.agent_auth = AgentAuthenticator()
-            application.state.scorer = scorer or NullScorer()
+            application.state.scorer = scorer
             application.state.enricher = HttpEnricher(upstream)
             application.state.pipeline = DecisionPipeline(store, application.state.enricher, application.state.scorer)
             application.state.notifier = ApprovalNotifier()
@@ -129,6 +142,9 @@ def create_app(
                     reload_task.cancel()
                 if listener is not None:
                     await listener.close()
+                close = getattr(application.state.scorer, "aclose", None)
+                if close is not None:
+                    await close()
                 await pool.close()
 
     application = FastAPI(

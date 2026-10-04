@@ -1,8 +1,26 @@
 """Use case referencyjny end-to-end: agent → proxy → magazyn / marketplace, z decyzjami i HITL."""
 
+from types import SimpleNamespace
+
+from app.pipeline.jev import JevScorer
 from tests.conftest import AUTH, open_session, reload, rows, sql
 
 PLN = lambda amount: {"amount": amount, "currency": "PLN"}  # noqa: E731
+
+
+def _mock_jev(choice: str, confidence: float = 0.9) -> JevScorer:
+    probs = {"clear": 0.05, "caution": 0.05, "deny": 0.05}
+    probs[choice] = 0.9
+
+    async def system_one(**kwargs):
+        return SimpleNamespace(
+            model="jev-test",
+            choices={
+                "verdict": SimpleNamespace(choice=choice, probabilities=probs, confidence=confidence),
+            },
+        )
+
+    return JevScorer(system_one=system_one, model="jev-test")
 
 
 def order(offer_id: str = "off_bm_pap", quantity: int = 38, price: str = "118.00") -> dict:
@@ -68,6 +86,27 @@ def test_ungrounded_offer_is_blocked(client, upstreams) -> None:
     response = client.post("/apps/marketplace/orders", json=order(), headers=headers)
     assert response.status_code == 403
     assert "marketplace.offer_not_grounded" in {r["code"] for r in decision(response.json()["decision_id"])["reasons"]}
+
+
+def test_jev_clears_policy_escalate(make_client, upstreams) -> None:
+    client = make_client(scorer=_mock_jev("clear", confidence=0.9))
+    headers = prepare(client, upstreams, "fresh_domain_discount")
+    response = client.post("/apps/marketplace/orders", json=order("off_pr_pap", price="36.00"), headers=headers)
+    assert response.status_code == 201, response.text
+    row = decision(response.headers["x-decision-id"])
+    assert row["verdict"] == "allow"
+    assert row["chain"][2]["stage"] == "specialist" and row["chain"][2]["outcome"] == "clear"
+    assert row["signals"]["choice"] == "clear"
+
+
+def test_jev_caution_keeps_hitl(make_client, upstreams) -> None:
+    client = make_client(scorer=_mock_jev("caution", confidence=0.85))
+    headers = prepare(client, upstreams, "fresh_domain_discount")
+    response = client.post("/apps/marketplace/orders", json=order("off_pr_pap", price="36.00"), headers=headers)
+    assert response.status_code == 202, response.text
+    row = decision(response.json()["decision_id"])
+    assert row["verdict"] == "escalate"
+    assert row["chain"][2]["outcome"] == "caution"
 
 
 def test_fresh_domain_escalates_and_approve_executes_once(client, upstreams) -> None:

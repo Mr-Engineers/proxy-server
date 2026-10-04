@@ -1,6 +1,6 @@
-"""Punkt wpięcia toru M (S18). Tu podłączamy modele ONNX — reszta pipeline'u się nie zmienia.
+"""Punkt wpięcia toru M (S18). Jev (TypeSafe) lub inny specjalista — reszta pipeline'u się nie zmienia.
 
-`score` — sygnały dla akcji w hopie B (injection z historii sesji, fraud, alignment).
+`score` — sygnały dla akcji w hopie B (Choice clear/caution/deny, alignment, fraud).
 `scan` — skan tekstów z odpowiedzi aplikacji i wejścia do LLM; wynik trafia do `sessions.state.signals`.
 """
 
@@ -20,6 +20,8 @@ class MlScorer(Protocol):
         session_state: dict[str, Any],
         enrichment: dict[str, Any],
         facts: dict[str, Any],
+        *,
+        policy_reasons: list[str] | None = None,
     ) -> MlSignals: ...
 
     async def scan(self, texts: list[str]) -> dict[str, float]: ...
@@ -28,11 +30,13 @@ class MlScorer(Protocol):
 
 
 class NullScorer:
-    """Brak modeli: sygnały niedostępne, agregator v0 decyduje na regułach."""
+    """Brak modeli: sygnały niedostępne, agregator decyduje na regułach."""
 
     name = "none"
 
-    async def score(self, action, agent, session_state, enrichment, facts) -> MlSignals:
+    async def score(
+        self, action, agent, session_state, enrichment, facts, *, policy_reasons: list[str] | None = None,
+    ) -> MlSignals:
         return MlSignals()
 
     async def scan(self, texts: list[str]) -> dict[str, float]:

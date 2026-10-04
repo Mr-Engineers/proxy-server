@@ -168,6 +168,80 @@ def test_aggregator_with_ml_signals() -> None:
     result = aggregate("write", policy("allow"), medium, False, False, True)
     assert result.verdict is Verdict.ESCALATE and result.deny_prob == 0.5
     assert aggregate("read", policy("allow"), medium, False, False, True).verdict is Verdict.ALLOW
+    cleared = aggregate("write", policy("escalate"), MlSignals(available=True, p_malicious=0.1), False, False, True)
+    assert cleared.verdict is Verdict.ALLOW and cleared.specialist_outcome == "clear"
+
+
+def test_aggregator_choice_confidence() -> None:
+    clear = MlSignals(available=True, choice="clear", confidence=0.9, alignment=0.9, p_malicious=0.05)
+    assert aggregate("write", policy("escalate"), clear, False, False, True).verdict is Verdict.ALLOW
+
+    low_conf = MlSignals(available=True, choice="clear", confidence=0.4, alignment=0.7, p_malicious=0.1)
+    assert aggregate("write", policy("escalate"), low_conf, False, False, True).verdict is Verdict.ESCALATE
+
+    deny = MlSignals(available=True, choice="deny", confidence=0.9, alignment=0.05, p_malicious=0.9)
+    assert aggregate("write", policy("escalate"), deny, False, False, True).verdict is Verdict.DENY
+
+    caution = MlSignals(available=True, choice="caution", confidence=0.85, alignment=0.4, p_malicious=0.2)
+    assert aggregate("write", policy("escalate"), caution, False, False, True).verdict is Verdict.ESCALATE
+
+    hard = policy("deny", Reason(code="x", severity="deny"))
+    assert aggregate("write", hard, clear, False, False, True).verdict is Verdict.DENY
+
+
+# --- Jev packs / scorer -------------------------------------------------------
+
+
+def test_resolve_use_case_and_describe() -> None:
+    from app.pipeline.jev import JevScorer
+    from app.pipeline.jev_packs import resolve_use_case
+
+    assert resolve_use_case("purchasing-agent") == "purchasing"
+    assert resolve_use_case("dispute-bot") == "dispute"
+    assert resolve_use_case("refund-agent") == "dispute"
+
+    cards = JevScorer(system_one=None, api_key="test").describe()
+    assert {card["id"] for card in cards} == {"spc_purchasing", "spc_dispute"}
+
+
+def test_jev_scorer_maps_choice() -> None:
+    import asyncio
+    from types import SimpleNamespace
+
+    from app.pipeline.jev import JevScorer
+    from app.pipeline.models import Action
+
+    async def fake_system_one(**kwargs):
+        assert kwargs["state"]["tool"] == "marketplace.place_order"
+        assert "marketplace.qty_ratio_exceeded" in kwargs["state"]["policy_reasons"]
+        assert kwargs["questions"]["verdict"]["type"] == "choice"
+        return SimpleNamespace(
+            model="jev-test",
+            choices={
+                "verdict": SimpleNamespace(
+                    choice="clear",
+                    probabilities={"clear": 0.88, "caution": 0.1, "deny": 0.02},
+                    confidence=0.86,
+                )
+            },
+        )
+
+    async def run() -> None:
+        scorer = JevScorer(system_one=fake_system_one, model="jev-test")
+        agent = AgentConfig(id="purchasing-agent", name="P", status="active", mandate="restock low stock")
+        action = Action(
+            app="marketplace", tool="marketplace.place_order", kind="write",
+            args={"quantity": 40}, session_id="s1", agent_id=agent.id,
+        )
+        signals = await scorer.score(
+            action, agent, {"stock_needs": [{"sku": "PAP"}]}, {},
+            {"qty_ratio_pct": 120}, policy_reasons=["marketplace.qty_ratio_exceeded"],
+        )
+        assert signals.available and signals.choice == "clear"
+        assert signals.confidence == 0.86 and signals.alignment == 0.88
+        assert signals.specialist == "local/purchasing"
+
+    asyncio.run(run())
 
 
 # --- parametry pakietów -------------------------------------------------------

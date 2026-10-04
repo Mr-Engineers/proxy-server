@@ -311,10 +311,17 @@ def test_workspace_settings_and_operators(client) -> None:
     assert len(client.get("/api/v1/settings/operators").json()["items"]) == 1
 
 
-def test_specialists_and_simulator(client) -> None:
+def test_specialists_and_simulator(client, make_client) -> None:
     assert client.get("/api/v1/specialists").json() == {"items": [], "nextCursor": None}
     assert client.get("/api/v1/specialists/spc_x").status_code == 404
     assert client.post("/api/v1/simulator/runs").status_code == 501
+
+    from app.pipeline.jev import JevScorer
+
+    jev_client = make_client(scorer=JevScorer(system_one=None, api_key="test-key"))
+    items = jev_client.get("/api/v1/specialists").json()["items"]
+    assert {item["id"] for item in items} == {"spc_purchasing", "spc_dispute"}
+    assert jev_client.get("/api/v1/specialists/spc_purchasing").status_code == 200
 
 
 # --- NOTIFY, joby ---------------------------------------------------------------

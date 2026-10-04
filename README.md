@@ -6,14 +6,14 @@ Dokumentacja architektury: [`../docs`](../docs/README.md). Kontrakty UI: [`../do
 
 ## Stan
 
-Warstwa deterministyczna i HITL gotowe pod pierwszy use case (agent zakupowy). ML: tylko punkt wpięcia (`MlScorer`), modeli brak — decyduje agregator v0 na regułach.
+Warstwa deterministyczna i HITL gotowe pod pierwszy use case (agent zakupowy). Specjalista: TypeSafe Jev (`JevScorer`) przy `TYPESAFE_API_KEY` — Choice clear/caution/deny na escalate/`needs_ai`; bez klucza `NullScorer` i agregator na regułach.
 
 | Obszar | Co działa |
 |---|---|
 | Auth agenta (D6) | `Authorization: Bearer ak_<key_id>_<secret>`, w bazie tylko SHA-256; `status` agenta `active` / `disabled` / `revoked` |
 | Sesje (D7) | `POST /v1/sessions`, `X-Session-Id` przypięte do agenta, `POST /v1/sessions/{id}/close` |
 | Katalog akcji (D3) | `proxy.tools`: trasa → `app.tool`; nieznana trasa = DENY; parametry ścieżki `{id}`; `args` / `capture` / `scan` przez JSONPath |
-| Pipeline (S10) | walidacja `input_schema` → kwoty → RBAC → enrichment → Cedar + reguły UI → sygnały ML → agregator v0 → `decisions` |
+| Pipeline (S10) | walidacja `input_schema` → kwoty → RBAC → enrichment → Cedar + reguły UI → Jev/ML → agregator → `decisions` |
 | Polityki (S9) | pakiety Cedar per aplikacja (`policies/<app>/`), parametry + overrides tylko zaostrzające, grounding z sesji, budżet z `spend_ledger` |
 | RBAC (P2) | role (`proxy.roles`) z grantami per tool lub całą aplikację; uprawnienia = rola ∪ `agent_permissions` |
 | Reguły UI (P4) | drzewo `when` / `then`, first match wins, `allow` / `deny` / `needs_ai`; ewaluator w Pythonie |
@@ -78,16 +78,16 @@ request → auth agenta → sesja → katalog akcji (nieznana trasa → DENY)
   → hop request → walidacja input_schema → kwoty (→ rate_limited)
   → RBAC (rola ∪ bezpośrednie) → enrichment (apps.enrichment, cache)
   → Cedar (pakiet aplikacji, fakty z sesji, budżet z ledgera) + reguły UI (first match)
-  → MlScorer.score (dziś NullScorer) → agregator v0
+  → MlScorer.score (Jev gdy `TYPESAFE_API_KEY`, inaczej NullScorer) → agregator
   → allow: upstream → hop response → capture do sesji → ledger
   → deny: 403 (+ licznik odmów) · escalate: approval + 202 · rate_limited: 429
 ```
 
-Agregator v0: `deny` z polityk jest ostateczne; `escalate` z polityk → człowiek; `needs_ai` bez modeli → człowiek (gdy `specialistFailClosed`) lub allow; reguła UI `allow` pomija specjalistę, ale nie omija Cedar. Progi τ dla przyszłych sygnałów ML są w `app/pipeline/aggregator.py`.
+Agregator: `deny` z polityk jest ostateczne; specjalista (Jev Choice `clear`/`caution`/`deny` + confidence) odpala się przy Cedar `escalate` lub UI `needs_ai` i może **clear → allow**; bez modelu `needs_ai` → człowiek (gdy `specialistFailClosed`) lub allow. Progi τ w `app/pipeline/aggregator.py`.
 
 ### Wpięcie ML (tor M)
 
-`app/pipeline/ml.py` — implementacja `MlScorer` (`score`, `scan`, `describe`) przekazana do `create_app(scorer=...)`. `score` dostaje akcję, agenta (mandat), stan sesji (w tym `signals` ze skanów i `llm_tool_calls`), enrichment i fakty. `scan` dostaje teksty z odpowiedzi aplikacji (`tools.scan_mode` / `scan`) i z wejścia do LLM. `describe` zasila `GET /api/v1/specialists`.
+`app/pipeline/jev.py` — `JevScorer` (TypeSafe System One) za `MlScorer`. Domyślnie włączany przez `TYPESAFE_API_KEY` w `create_app`, albo wstrzyknięty `create_app(scorer=...)`. `score` dostaje akcję, mandat, sesję, enrichment, fakty i kody powodów polityk; zwraca Choice + confidence. `describe` zasila `GET /api/v1/specialists` (purchasing + dispute).
 
 ## Konfiguracja
 

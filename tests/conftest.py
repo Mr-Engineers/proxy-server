@@ -207,13 +207,14 @@ def database(monkeypatch) -> str:
 def make_client(database: str, upstreams: FakeUpstreams) -> Iterator[Callable[..., TestClient]]:
     clients: list[TestClient] = []
 
-    def factory(settings: Settings | None = None, **overrides) -> TestClient:
+    def factory(settings: Settings | None = None, scorer=None, **overrides) -> TestClient:
         defaults = {"listen_notifications": False, "background_jobs": False, "admin_auth_disabled": True}
         settings = settings or Settings(database_url=database, **{**defaults, **overrides})
         application = create_app(
             settings=settings,
             transport=httpx.MockTransport(upstreams),
             aws_credentials=Credentials("AKIDEXAMPLE", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"),
+            scorer=scorer,
         )
         client = TestClient(application)
         client.__enter__()

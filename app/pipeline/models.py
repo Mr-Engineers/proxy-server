@@ -69,6 +69,8 @@ class MlSignals(BaseModel):
     alignment: float | None = None
     fraud: float | None = None
     p_malicious: float | None = None
+    choice: Literal["clear", "caution", "deny"] | None = None
+    confidence: float | None = None
     specialist: str = "rules/v0"
     version: str = "v0"
     latency_ms: float = 0.0

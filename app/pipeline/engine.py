@@ -129,11 +129,13 @@ class DecisionPipeline:
             })
         chain.append(self._rules_step(policy, rule.outcome, rule.detail))
 
-        signals = await self._score(ctx, policy)
+        needs_ai = rule.outcome == "needs_ai"
+        signals = await self._score(ctx, policy, needs_ai=needs_ai)
         if signals.failed:
             degraded = True
             notes.append("specialist failed")
-            if action.kind == "write" and policy.verdict != "deny":
+            # Fail closed to HITL on escalate/needs_ai; only hard-deny unexpected write failures.
+            if action.kind == "write" and policy.verdict == "allow" and not needs_ai:
                 policy = policy.model_copy(update={
                     "verdict": "deny",
                     "reasons": [*policy.reasons, Reason(code="pipeline_degraded", severity="deny", message="Specialist unavailable for write action", source="ml")],
@@ -143,7 +145,7 @@ class DecisionPipeline:
             action.kind,
             policy,
             signals,
-            needs_ai=rule.outcome == "needs_ai",
+            needs_ai=needs_ai,
             rule_allowed=rule.outcome == "allow",
             fail_closed=snapshot.settings.specialist_fail_closed,
         )
@@ -226,11 +228,21 @@ class DecisionPipeline:
                 )
             return PolicyResult(verdict="allow", config_revision=ctx.snapshot.revision, errors=[str(exc)])
 
-    async def _score(self, ctx: DecisionContext, policy: PolicyResult) -> MlSignals:
+    async def _score(self, ctx: DecisionContext, policy: PolicyResult, *, needs_ai: bool) -> MlSignals:
         if policy.verdict == "deny":
             return MlSignals()
+        # Specialist only when it can change the outcome (cost/latency).
+        if policy.verdict != "escalate" and not needs_ai:
+            return MlSignals()
         try:
-            return await self.scorer.score(ctx.action, ctx.agent, ctx.session_state, ctx.enrichment, policy.facts)
+            return await self.scorer.score(
+                ctx.action,
+                ctx.agent,
+                ctx.session_state,
+                ctx.enrichment,
+                policy.facts,
+                policy_reasons=[reason.code for reason in policy.reasons],
+            )
         except Exception:
             logger.exception("specialist_error", extra={"fields": {"tool": ctx.action.tool}})
             return MlSignals(failed=True)

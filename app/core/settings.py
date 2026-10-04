@@ -37,6 +37,11 @@ class Settings(BaseSettings):
     retention_sweep_seconds: float = 3600.0
     config_reload_debounce_seconds: float = 0.3
 
+    # TypeSafe Jev specialist (optional — NullScorer when unset)
+    typesafe_api_key: SecretStr | None = None
+    typesafe_model: str = "jev-latest"
+    jev_timeout_seconds: float = 0.8
+
     @property
     def cors_origin_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
