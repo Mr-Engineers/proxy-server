@@ -209,40 +209,16 @@ def test_resolve_use_case_and_describe() -> None:
     assert resolve_use_case("purchasing-agent") == "purchasing"
     assert resolve_use_case("unknown-agent") == "purchasing"
 
-    cards = JevScorer(api_key=None, fallback=True).describe()
-    assert {card["id"] for card in cards} == {"spc_jev"}
-    assert cards[0]["health"] == "healthy"
+    # Without a key / inject, JevScorer cannot call TypeSafe.
+    unloaded = JevScorer(api_key=None).describe()
+    assert {card["id"] for card in unloaded} == {"spc_jev"}
+    assert unloaded[0]["health"] == "unavailable"
+    live = JevScorer(system_one=None, api_key="test-key-not-used-for-describe").describe()
+    # api_key constructs a client → healthy card (no network yet)
+    assert live[0]["health"] == "healthy"
     null_cards = NullScorer().describe()
     assert {card["id"] for card in null_cards} == {"spc_jev"}
     assert null_cards[0]["health"] == "unavailable"
-
-
-def test_heuristic_fallback_young_merchant() -> None:
-    import asyncio
-
-    from app.pipeline.jev import JevScorer
-    from app.pipeline.models import Action
-
-    async def run() -> None:
-        scorer = JevScorer(api_key=None, fallback=True, model="jev-latest")
-        agent = AgentConfig(id="purchasing-agent", name="P", status="active", mandate="restock")
-        action = Action(
-            app="marketplace", tool="marketplace.place_order", kind="write",
-            args={"offer_id": "off_pr_pap", "quantity": 47}, session_id="s1", agent_id=agent.id,
-        )
-        signals = await scorer.score(
-            action, agent, {}, {},
-            {"sku_needed": True, "qty_ratio_pct": 100, "merchant_domain_age_days": 30, "offer_seen_in_session": True},
-            policy_reasons=["marketplace.merchant_too_young"],
-        )
-        assert signals.available and not signals.failed
-        assert signals.choice == "caution"
-        assert signals.confidence and signals.confidence >= 0.8
-        assert signals.alignment == 0.16 and signals.p_malicious == 0.14
-        assert signals.specialist == "jev"
-        assert "fallback" in signals.version
-
-    asyncio.run(run())
 
 
 def test_jev_scorer_maps_choice() -> None:
@@ -251,11 +227,14 @@ def test_jev_scorer_maps_choice() -> None:
 
     from app.pipeline.jev import JevScorer
     from app.pipeline.models import Action
+    from typesafe_sdk import Choice
 
     async def fake_system_one(**kwargs):
         assert kwargs["state"]["tool"] == "marketplace.place_order"
         assert "marketplace.qty_ratio_exceeded" in kwargs["state"]["policy_reasons"]
-        assert kwargs["questions"]["verdict"]["type"] == "choice"
+        question = kwargs["questions"]["verdict"]
+        assert isinstance(question, Choice)
+        assert question.type == "choice"
         return SimpleNamespace(
             model="jev-test",
             choices={
@@ -265,6 +244,7 @@ def test_jev_scorer_maps_choice() -> None:
                     confidence=0.86,
                 )
             },
+            answers={},
         )
 
     async def run() -> None:

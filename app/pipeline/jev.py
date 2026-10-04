@@ -8,9 +8,8 @@ from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 
 from app.config.models import AgentConfig
-from app.pipeline.jev_packs import choice_question, describe_all, pack_for, resolve_use_case
+from app.pipeline.jev_packs import SpecialistPack, describe_all, pack_for, resolve_use_case
 from app.pipeline.models import Action, MlSignals
-from app.pipeline.specialist_fallback import heuristic_score
 
 logger = logging.getLogger("proxy.jev")
 
@@ -58,6 +57,13 @@ def build_state(
     }
 
 
+def choice_question(pack: SpecialistPack) -> Any:
+    """Build a TypeSafe Choice question from the specialist pack."""
+    from typesafe_sdk import Choice
+
+    return Choice(instructions=pack.instructions, criteria=dict(pack.criteria))
+
+
 def _signals_from_choice(
     *,
     choice: str,
@@ -68,12 +74,10 @@ def _signals_from_choice(
     latency_ms: float,
 ) -> MlSignals:
     normalized = choice if choice in {"clear", "caution", "deny"} else "caution"
-    alignment = float(probabilities.get("clear", 0.0))
-    p_malicious = float(probabilities.get("deny", 0.0))
     return MlSignals(
         available=True,
-        alignment=alignment,
-        p_malicious=p_malicious,
+        alignment=float(probabilities.get("clear", 0.0)),
+        p_malicious=float(probabilities.get("deny", 0.0)),
         choice=normalized,  # type: ignore[arg-type]
         confidence=float(confidence),
         specialist=specialist,
@@ -92,28 +96,19 @@ class JevScorer:
         *,
         api_key: str | None = None,
         model: str = "jev-latest",
-        timeout_seconds: float = 5.0,
+        timeout_seconds: float = 10.0,
         system_one: SystemOneFn | None = None,
-        fallback: bool = True,
     ) -> None:
-        self.api_key = api_key
+        self.api_key = (api_key or "").strip() or None
         self.model = model
         self.timeout_seconds = timeout_seconds
-        self.fallback = fallback
         self._system_one = system_one
         self._client: Any = None
+        if self._system_one is None and self.api_key:
+            # Fail fast on invalid key shape at construction (same checks as the SDK).
+            from typesafe_sdk import AsyncTypeSafeClient
 
-    async def _ensure_client(self) -> Any:
-        if self._system_one is not None:
-            return None
-        if not (self.api_key or "").strip():
-            return None
-        if self._client is not None:
-            return self._client
-        from typesafe_sdk import AsyncTypeSafeClient
-
-        self._client = AsyncTypeSafeClient(api_key=self.api_key, model=self.model, timeout=self.timeout_seconds)
-        return self._client
+            self._client = AsyncTypeSafeClient(api_key=self.api_key, model=self.model, timeout=self.timeout_seconds)
 
     async def aclose(self) -> None:
         if self._client is not None:
@@ -132,10 +127,7 @@ class JevScorer:
     ) -> MlSignals:
         use_case = resolve_use_case(agent.id)
         pack = pack_for(use_case)
-        # No hosted client and no inject → deterministic evaluate from pipeline facts.
-        if self._system_one is None and not (self.api_key or "").strip():
-            if self.fallback:
-                return heuristic_score(pack, facts, policy_reasons, version=f"{self.model}+fallback")
+        if self._system_one is None and self._client is None:
             return MlSignals(failed=True, specialist=pack.model_id, version=self.model)
 
         state = build_state(
@@ -152,25 +144,22 @@ class JevScorer:
                 "jev_score_failed",
                 extra={"fields": {
                     "tool": action.tool, "agent_id": agent.id, "model": self.model,
-                    "error": type(exc).__name__, "detail": str(exc)[:300], "latency_ms": round(latency_ms, 1),
+                    "error": type(exc).__name__, "detail": str(exc)[:500], "latency_ms": round(latency_ms, 1),
                 }},
             )
-            if self.fallback:
-                return heuristic_score(
-                    pack, facts, policy_reasons,
-                    version=f"{self.model}+fallback", latency_ms=max(latency_ms, 1.0),
-                )
             return MlSignals(failed=True, specialist=pack.model_id, version=self.model, latency_ms=latency_ms)
 
         latency_ms = (time.perf_counter() - started) * 1000
         answer = _extract_choice(response, "verdict")
         if answer is None:
-            logger.error("jev_missing_verdict", extra={"fields": {"tool": action.tool}})
-            if self.fallback:
-                return heuristic_score(
-                    pack, facts, policy_reasons,
-                    version=f"{self.model}+fallback", latency_ms=max(latency_ms, 1.0),
-                )
+            logger.error(
+                "jev_missing_verdict",
+                extra={"fields": {
+                    "tool": action.tool,
+                    "answer_keys": sorted(getattr(response, "answers", {}) or {}),
+                    "choice_keys": sorted(getattr(response, "choices", {}) or {}),
+                }},
+            )
             return MlSignals(failed=True, specialist=pack.model_id, version=self.model, latency_ms=latency_ms)
 
         choice, probabilities, confidence, model_version = answer
@@ -186,18 +175,15 @@ class JevScorer:
     async def _call(self, state: dict[str, Any], questions: dict[str, Any]) -> Any:
         if self._system_one is not None:
             return await self._system_one(state=state, questions=questions, model=self.model)
-
-        client = await self._ensure_client()
-        if client is None:
-            raise RuntimeError("TypeSafe client not configured")
-        return await client.system_one(state=state, questions=questions, model=self.model, timeout=self.timeout_seconds)
+        return await self._client.system_one(
+            state=state, questions=questions, model=self.model, timeout=self.timeout_seconds,
+        )
 
     async def scan(self, texts: list[str]) -> dict[str, float]:
         return {}
 
     def describe(self) -> list[dict[str, Any]]:
-        # Fallback keeps the specialist card available even without TYPESAFE_API_KEY.
-        health = "healthy" if (self.api_key or self._system_one or self.fallback) else "unavailable"
+        health = "healthy" if (self._client is not None or self._system_one is not None) else "unavailable"
         return describe_all(
             model=self.model,
             latency_budget_ms=int(self.timeout_seconds * 1000),
@@ -206,20 +192,12 @@ class JevScorer:
 
 
 def _extract_choice(response: Any, key: str) -> tuple[str, dict[str, float], float, str | None] | None:
-    choices = getattr(response, "choices", None)
-    if isinstance(choices, Mapping) and key in choices:
-        answer = choices[key]
-        choice = getattr(answer, "choice", None)
-        probabilities = dict(getattr(answer, "probabilities", {}) or {})
-        confidence = float(getattr(answer, "confidence", 0.0) or 0.0)
-        model = getattr(response, "model", None)
-        if choice is None:
-            return None
-        return str(choice), {str(k): float(v) for k, v in probabilities.items()}, confidence, str(model) if model else None
-
-    answers = getattr(response, "answers", None)
-    if isinstance(answers, Mapping) and key in answers:
-        answer = answers[key]
+    """Read Choice answer from SystemOneResponse (.choices / .answers) or plain dicts."""
+    for container_name in ("choices", "answers"):
+        container = getattr(response, container_name, None)
+        if not isinstance(container, Mapping) or key not in container:
+            continue
+        answer = container[key]
         if isinstance(answer, Mapping):
             choice = answer.get("choice")
             probabilities = dict(answer.get("probabilities") or {})
@@ -228,9 +206,8 @@ def _extract_choice(response: Any, key: str) -> tuple[str, dict[str, float], flo
             choice = getattr(answer, "choice", None)
             probabilities = dict(getattr(answer, "probabilities", {}) or {})
             confidence = float(getattr(answer, "confidence", 0.0) or 0.0)
-        model = getattr(response, "model", None)
         if choice is None:
             return None
+        model = getattr(response, "model", None)
         return str(choice), {str(k): float(v) for k, v in probabilities.items()}, confidence, str(model) if model else None
-
     return None

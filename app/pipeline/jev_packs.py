@@ -90,15 +90,6 @@ def pack_by_id(specialist_id: str) -> SpecialistPack | None:
     return next((pack for pack in load_packs() if pack.id == specialist_id), None)
 
 
-def choice_question(pack: SpecialistPack) -> dict[str, Any]:
-    """Raw question dict (works with SDK objects or plain system_one dicts)."""
-    return {
-        "type": "choice",
-        "instructions": pack.instructions,
-        "criteria": dict(pack.criteria),
-    }
-
-
 def describe_pack(
     pack: SpecialistPack,
     *,

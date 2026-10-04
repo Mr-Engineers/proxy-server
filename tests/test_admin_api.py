@@ -315,10 +315,18 @@ def test_workspace_settings_and_operators(client) -> None:
 def test_specialists_and_simulator(client, make_client) -> None:
     items = client.get("/api/v1/specialists").json()["items"]
     assert {item["id"] for item in items} == {"spc_jev"}
-    assert items[0]["health"] == "healthy"  # heuristic fallback keeps specialist online
+    # Default test app has no TYPESAFE_API_KEY → NullScorer lists pack as unavailable.
+    assert items[0]["health"] == "unavailable"
     assert client.get("/api/v1/specialists/spc_x").status_code == 404
     assert client.post("/api/v1/simulator/runs").status_code == 501
-    assert client.get("/api/v1/specialists/spc_jev").status_code == 200
+
+    from app.pipeline.jev import JevScorer
+
+    jev_client = make_client(scorer=JevScorer(system_one=None, api_key="test-key"))
+    live = jev_client.get("/api/v1/specialists").json()["items"]
+    assert {item["id"] for item in live} == {"spc_jev"}
+    assert live[0]["health"] == "healthy"
+    assert jev_client.get("/api/v1/specialists/spc_jev").status_code == 200
 
 
 # --- NOTIFY, joby ---------------------------------------------------------------
