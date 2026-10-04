@@ -8,7 +8,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 
 from app.config.models import AgentConfig
-from app.pipeline.jev_packs import PACKS, SpecialistPack, choice_question, pack_for, resolve_use_case
+from app.pipeline.jev_packs import choice_question, describe_all, pack_for, resolve_use_case
 from app.pipeline.models import Action, MlSignals
 
 logger = logging.getLogger("proxy.jev")
@@ -91,7 +91,7 @@ class JevScorer:
         *,
         api_key: str | None = None,
         model: str = "jev-latest",
-        timeout_seconds: float = 0.8,
+        timeout_seconds: float = 5.0,
         system_one: SystemOneFn | None = None,
     ) -> None:
         self.api_key = api_key
@@ -135,9 +135,16 @@ class JevScorer:
         started = time.perf_counter()
         try:
             response = await self._call(state, questions)
-        except Exception:
-            logger.exception("jev_score_failed", extra={"fields": {"tool": action.tool, "agent_id": agent.id}})
-            return MlSignals(failed=True, specialist=pack.model_id, version=self.model)
+        except Exception as exc:
+            latency_ms = (time.perf_counter() - started) * 1000
+            logger.exception(
+                "jev_score_failed",
+                extra={"fields": {
+                    "tool": action.tool, "agent_id": agent.id, "model": self.model,
+                    "error": type(exc).__name__, "detail": str(exc)[:300], "latency_ms": round(latency_ms, 1),
+                }},
+            )
+            return MlSignals(failed=True, specialist=pack.model_id, version=self.model, latency_ms=latency_ms)
 
         latency_ms = (time.perf_counter() - started) * 1000
         answer = _extract_choice(response, "verdict")
@@ -166,32 +173,11 @@ class JevScorer:
         return {}
 
     def describe(self) -> list[dict[str, Any]]:
-        return [_describe_pack(pack, self.model, int(self.timeout_seconds * 1000)) for pack in PACKS.values()]
-
-
-def _describe_pack(pack: SpecialistPack, model: str, latency_budget_ms: int) -> dict[str, Any]:
-    return {
-        "id": pack.id,
-        "name": pack.name,
-        "agentId": pack.agent_id,
-        "modelId": pack.model_id,
-        "version": model,
-        "health": "healthy",
-        "latencyP95Ms": 0,
-        "latencyBudgetMs": latency_budget_ms,
-        "errorRatePct": 0,
-        "falseClearRatePct": 0,
-        "evaluatesToday": 0,
-        "clearToday": 0,
-        "cautionToday": 0,
-        "clearThreshold": 0.82,
-        "onFailure": "escalate_human",
-        "circuitBreaker": {"open": False, "failures": 0, "threshold": 5, "cooldownSeconds": 60},
-        "criteriaSummary": pack.criteria_summary,
-        "useCase": pack.use_case,
-        "loadedAt": None,
-        "lastEvaluateAt": None,
-    }
+        return describe_all(
+            model=self.model,
+            latency_budget_ms=int(self.timeout_seconds * 1000),
+            health="healthy" if (self.api_key or self._system_one) else "unavailable",
+        )
 
 
 def _extract_choice(response: Any, key: str) -> tuple[str, dict[str, float], float, str | None] | None:

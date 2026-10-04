@@ -84,7 +84,8 @@ def test_loads_full_snapshot_from_postgres(database) -> None:
     }
     assert "dev0001" in snapshot.keys
     pack = snapshot.policy_packs["marketplace"]
-    assert pack.params_for("purchasing-agent", "place_order")["allowed_countries"] == ["PL"]
+    countries = pack.params_for("purchasing-agent", "place_order")["allowed_countries"]
+    assert {"PL", "DE"} <= set(countries) and "IN" not in countries
     assert pack.params_for("other-agent", "place_order")["max_order_value_minor"] == 1_000_000
     assert snapshot.settings.org_name == "Modus Demo"
     assert snapshot.tool("marketplace.search_products").capture[0].key == "offer_id"

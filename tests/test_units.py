@@ -159,6 +159,10 @@ def test_aggregator_v0() -> None:
     assert aggregate("read", policy("allow"), none, False, False, True).verdict is Verdict.ALLOW
     ruled = aggregate("write", policy("allow"), none, False, True, True)
     assert ruled.verdict is Verdict.ALLOW and ruled.specialist_detail == "Rule short-circuit"
+    failed = MlSignals(failed=True, specialist="jev", version="jev-latest")
+    failed_agg = aggregate("write", policy("allow"), failed, True, False, True)
+    assert failed_agg.verdict is Verdict.ESCALATE
+    assert "specialist.failed" in {r.code for r in failed_agg.reasons}
 
 
 def test_aggregator_with_ml_signals() -> None:
@@ -194,14 +198,20 @@ def test_aggregator_choice_confidence() -> None:
 
 def test_resolve_use_case_and_describe() -> None:
     from app.pipeline.jev import JevScorer
-    from app.pipeline.jev_packs import resolve_use_case
+    from app.pipeline.jev_packs import load_packs, resolve_use_case
+    from app.pipeline.ml import NullScorer
 
+    packs = load_packs()
+    assert len(packs) == 1 and packs[0].id == "spc_jev"
     assert resolve_use_case("purchasing-agent") == "purchasing"
-    assert resolve_use_case("dispute-bot") == "dispute"
-    assert resolve_use_case("refund-agent") == "dispute"
+    assert resolve_use_case("unknown-agent") == "purchasing"
 
     cards = JevScorer(system_one=None, api_key="test").describe()
-    assert {card["id"] for card in cards} == {"spc_purchasing", "spc_dispute"}
+    assert {card["id"] for card in cards} == {"spc_jev"}
+    assert cards[0]["health"] == "healthy"
+    null_cards = NullScorer().describe()
+    assert {card["id"] for card in null_cards} == {"spc_jev"}
+    assert null_cards[0]["health"] == "unavailable"
 
 
 def test_jev_scorer_maps_choice() -> None:
@@ -239,7 +249,7 @@ def test_jev_scorer_maps_choice() -> None:
         )
         assert signals.available and signals.choice == "clear"
         assert signals.confidence == 0.86 and signals.alignment == 0.88
-        assert signals.specialist == "local/purchasing"
+        assert signals.specialist == "jev"
 
     asyncio.run(run())
 

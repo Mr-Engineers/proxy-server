@@ -40,7 +40,7 @@ class Settings(BaseSettings):
     # TypeSafe Jev specialist (optional — NullScorer when unset)
     typesafe_api_key: SecretStr | None = None
     typesafe_model: str = "jev-latest"
-    jev_timeout_seconds: float = 0.8
+    jev_timeout_seconds: float = 5.0
 
     @property
     def cors_origin_list(self) -> list[str]:

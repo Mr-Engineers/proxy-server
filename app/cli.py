@@ -164,7 +164,7 @@ def _signals(verdict: str, reasons: list[str]) -> dict:
         "p_malicious": 0.18,
         "allow_prob": 0.22,
         "deny_prob": 0.18,
-        "specialist": "local/purchasing",
+        "specialist": "jev",
         "version": "jev-latest",
         "latency_ms": 186.0,
         "failed": False,

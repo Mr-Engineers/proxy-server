@@ -30,7 +30,10 @@ class MlScorer(Protocol):
 
 
 class NullScorer:
-    """Brak modeli: sygnały niedostępne, agregator decyduje na regułach."""
+    """Brak modeli: sygnały niedostępne, agregator decyduje na regułach.
+
+    `describe` nadal zwraca specjalistów z `specialists.json` (health=unavailable).
+    """
 
     name = "none"
 
@@ -43,4 +46,6 @@ class NullScorer:
         return {}
 
     def describe(self) -> list[dict[str, Any]]:
-        return []
+        from app.pipeline.jev_packs import describe_all
+
+        return describe_all(model="unloaded", latency_budget_ms=0, health="unavailable")

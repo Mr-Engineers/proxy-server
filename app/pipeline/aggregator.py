@@ -76,8 +76,20 @@ def aggregate(
         return Aggregate(Verdict.ALLOW, 1 - p, reasons, "clear", f"P(malicious) {p:.2f} < τ_low {tau_low}", allow_prob, deny_prob)
 
     if policy.verdict == "escalate":
+        if signals.failed:
+            reasons.append(Reason(
+                code="specialist.failed", severity="escalate",
+                message=f"Specialist call failed ({signals.specialist})", source="ml",
+            ))
+            return Aggregate(Verdict.ESCALATE, 0.5, reasons, "caution", "specialist failed → human", allow_prob, deny_prob)
         return Aggregate(Verdict.ESCALATE, 0.5, reasons, "caution", "caution → human (policy)", allow_prob, deny_prob)
     if needs_ai:
+        if signals.failed:
+            reasons.append(Reason(
+                code="specialist.failed", severity="escalate",
+                message=f"Specialist call failed ({signals.specialist})", source="ml",
+            ))
+            return Aggregate(Verdict.ESCALATE, 0.5, reasons, "caution", "specialist failed → human", allow_prob, deny_prob)
         if fail_closed:
             reasons.append(Reason(code="specialist.unavailable", severity="escalate", message="No specialist model loaded", source="ml"))
             return Aggregate(Verdict.ESCALATE, 0.5, reasons, "caution", "No specialist loaded → human", allow_prob, deny_prob)
