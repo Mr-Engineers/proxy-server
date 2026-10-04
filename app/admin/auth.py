@@ -8,6 +8,8 @@ import jwt
 from fastapi import HTTPException, Request
 
 ASYMMETRIC = ["RS256", "ES256", "EdDSA"]
+# Sekret Supabase ma 40+ znaków; krótszy to placeholder z SSM (CHANGE_ME), którym każdy podpisze token
+MIN_HS256_SECRET_LENGTH = 32
 
 
 @dataclass(frozen=True)
@@ -32,11 +34,12 @@ def decode_token(token: str, settings) -> dict[str, Any]:
     header = jwt.get_unverified_header(token)
     algorithm = header.get("alg")
     if algorithm == "HS256":
-        if settings.supabase_jwt_secret is None:
+        secret = settings.supabase_jwt_secret.get_secret_value() if settings.supabase_jwt_secret else ""
+        if len(secret) < MIN_HS256_SECRET_LENGTH:
             raise HTTPException(401, "HS256 tokens are not accepted")
         return jwt.decode(
             token,
-            settings.supabase_jwt_secret.get_secret_value(),
+            secret,
             algorithms=["HS256"],
             audience=settings.supabase_jwt_audience,
             options=options,
