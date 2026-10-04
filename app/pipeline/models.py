@@ -75,6 +75,11 @@ class MlSignals(BaseModel):
     version: str = "v0"
     latency_ms: float = 0.0
     failed: bool = False
+    # Populated when `failed` — shown in audit / AI review UI.
+    error: str | None = None
+    error_detail: str | None = None
+    error_status: int | None = None
+    error_request_id: str | None = None
 
 
 class Decision(BaseModel):

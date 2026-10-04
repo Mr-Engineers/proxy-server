@@ -79,24 +79,45 @@ def aggregate(
 
     if policy.verdict == "escalate":
         if signals.failed:
-            reasons.append(Reason(
-                code="specialist.failed", severity="escalate",
-                message=f"Specialist call failed ({signals.specialist})", source="ml",
-            ))
-            return Aggregate(Verdict.ESCALATE, 0.5, reasons, "caution", "specialist failed → human", None, None)
+            reasons.append(_failed_reason(signals))
+            return Aggregate(
+                Verdict.ESCALATE, 0.5, reasons, "caution",
+                _failed_detail(signals), None, None,
+            )
         return Aggregate(Verdict.ESCALATE, 0.5, reasons, "caution", "caution → human (policy)", None, None)
     if needs_ai:
         if signals.failed:
-            reasons.append(Reason(
-                code="specialist.failed", severity="escalate",
-                message=f"Specialist call failed ({signals.specialist})", source="ml",
-            ))
-            return Aggregate(Verdict.ESCALATE, 0.5, reasons, "caution", "specialist failed → human", None, None)
+            reasons.append(_failed_reason(signals))
+            return Aggregate(
+                Verdict.ESCALATE, 0.5, reasons, "caution",
+                _failed_detail(signals), None, None,
+            )
         if fail_closed:
             reasons.append(Reason(code="specialist.unavailable", severity="escalate", message="No specialist model loaded", source="ml"))
             return Aggregate(Verdict.ESCALATE, 0.5, reasons, "caution", "No specialist loaded → human", None, None)
         return Aggregate(Verdict.ALLOW, 0.5, reasons, "skipped", "No specialist loaded, fail-open", None, None)
     return Aggregate(Verdict.ALLOW, 0.8, reasons, "skipped", "No specialist loaded", None, None)
+
+
+def _failed_reason(signals: MlSignals) -> Reason:
+    parts = [signals.error or "Specialist call failed"]
+    if signals.error_status is not None:
+        parts.append(f"HTTP {signals.error_status}")
+    if signals.error_detail:
+        parts.append(signals.error_detail)
+    elif signals.specialist:
+        parts.append(signals.specialist)
+    if signals.error_request_id:
+        parts.append(f"request_id={signals.error_request_id}")
+    return Reason(code="specialist.failed", severity="escalate", message=" — ".join(parts), source="ml")
+
+
+def _failed_detail(signals: MlSignals) -> str:
+    if signals.error_detail:
+        return f"specialist failed: {signals.error_detail[:160]}"
+    if signals.error:
+        return f"specialist failed: {signals.error}"
+    return "specialist failed → human"
 
 
 def _aggregate_choice(

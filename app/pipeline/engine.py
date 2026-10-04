@@ -133,12 +133,17 @@ class DecisionPipeline:
         signals = await self._score(ctx, policy, needs_ai=needs_ai)
         if signals.failed:
             degraded = True
-            notes.append("specialist failed")
+            fail_note = signals.error_detail or signals.error or "specialist failed"
+            notes.append(fail_note)
             # Fail closed to HITL on escalate/needs_ai; only hard-deny unexpected write failures.
             if action.kind == "write" and policy.verdict == "allow" and not needs_ai:
                 policy = policy.model_copy(update={
                     "verdict": "deny",
-                    "reasons": [*policy.reasons, Reason(code="pipeline_degraded", severity="deny", message="Specialist unavailable for write action", source="ml")],
+                    "reasons": [*policy.reasons, Reason(
+                        code="pipeline_degraded", severity="deny",
+                        message=f"Specialist unavailable for write action: {fail_note}",
+                        source="ml",
+                    )],
                 })
 
         result = aggregate(
@@ -243,9 +248,13 @@ class DecisionPipeline:
                 policy.facts,
                 policy_reasons=[reason.code for reason in policy.reasons],
             )
-        except Exception:
-            logger.exception("specialist_error", extra={"fields": {"tool": ctx.action.tool}})
-            return MlSignals(failed=True)
+        except Exception as exc:
+            logger.exception("specialist_error", extra={"fields": {"tool": ctx.action.tool, "error": type(exc).__name__}})
+            return MlSignals(
+                failed=True,
+                error=type(exc).__name__,
+                error_detail=str(exc).strip()[:800] or type(exc).__name__,
+            )
 
     @staticmethod
     def _rules_step(policy: PolicyResult, rule_outcome: str | None, rule_detail: str) -> ChainStep:

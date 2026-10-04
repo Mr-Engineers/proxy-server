@@ -39,7 +39,9 @@ def decision(decision_id: str):
     return rows("select * from proxy.decisions where id = $1", decision_id)[0]
 
 
-def test_happy_path_full_flow(client, upstreams) -> None:
+def test_happy_path_full_flow(make_client, upstreams) -> None:
+    # Seed UI rules route register_po → needs_ai; mock Jev clear so the PO can auto-allow.
+    client = make_client(scorer=_mock_jev("clear"))
     headers = prepare(client, upstreams)
     response = client.post("/apps/marketplace/orders", json=order(), headers=headers)
     assert response.status_code == 201, response.text
@@ -140,7 +142,8 @@ def test_fresh_domain_escalates_and_approve_executes_once(client, upstreams) -> 
     queue = client.get("/api/v1/approvals").json()["items"]
     assert [item["id"] for item in queue] == [approval_id]
     assert queue[0]["matchedRules"] == ["Merchant domain is younger than the minimum age"]
-    assert queue[0]["modelChoice"] == "caution → human"
+    # Without a Jev scorer in this test, specialist stage is policy-only caution.
+    assert queue[0]["modelChoice"].startswith("caution → human")
 
     resolved = client.post(f"/api/v1/approvals/{approval_id}/allow")
     assert resolved.json() == {"id": approval_id, "decision": "allow", "mode": "once"}

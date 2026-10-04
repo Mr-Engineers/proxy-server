@@ -128,7 +128,11 @@ class JevScorer:
         use_case = resolve_use_case(agent.id)
         pack = pack_for(use_case)
         if self._system_one is None and self._client is None:
-            return MlSignals(failed=True, specialist=pack.model_id, version=self.model)
+            return MlSignals(
+                failed=True, specialist=pack.model_id, version=self.model,
+                error="TypeSafeClientNotConfigured",
+                error_detail="TYPESAFE_API_KEY is missing or invalid — Jev client was not constructed",
+            )
 
         state = build_state(
             action, agent, session_state, enrichment, facts,
@@ -140,27 +144,34 @@ class JevScorer:
             response = await self._call(state, questions)
         except Exception as exc:
             latency_ms = (time.perf_counter() - started) * 1000
+            err = describe_typesafe_error(exc)
             logger.exception(
                 "jev_score_failed",
                 extra={"fields": {
                     "tool": action.tool, "agent_id": agent.id, "model": self.model,
-                    "error": type(exc).__name__, "detail": str(exc)[:500], "latency_ms": round(latency_ms, 1),
+                    "latency_ms": round(latency_ms, 1), **err,
                 }},
             )
-            return MlSignals(failed=True, specialist=pack.model_id, version=self.model, latency_ms=latency_ms)
+            return MlSignals(
+                failed=True, specialist=pack.model_id, version=self.model, latency_ms=latency_ms,
+                error=err["error"], error_detail=err["error_detail"],
+                error_status=err.get("error_status"), error_request_id=err.get("error_request_id"),
+            )
 
         latency_ms = (time.perf_counter() - started) * 1000
         answer = _extract_choice(response, "verdict")
         if answer is None:
-            logger.error(
-                "jev_missing_verdict",
-                extra={"fields": {
-                    "tool": action.tool,
-                    "answer_keys": sorted(getattr(response, "answers", {}) or {}),
-                    "choice_keys": sorted(getattr(response, "choices", {}) or {}),
-                }},
+            answer_keys = sorted(getattr(response, "answers", {}) or {})
+            choice_keys = sorted(getattr(response, "choices", {}) or {})
+            detail = (
+                f"TypeSafe returned model={getattr(response, 'model', None)!r} but no Choice "
+                f"answer under key 'verdict' (answers={answer_keys}, choices={choice_keys})"
             )
-            return MlSignals(failed=True, specialist=pack.model_id, version=self.model, latency_ms=latency_ms)
+            logger.error("jev_missing_verdict", extra={"fields": {"tool": action.tool, "detail": detail}})
+            return MlSignals(
+                failed=True, specialist=pack.model_id, version=self.model, latency_ms=latency_ms,
+                error="MissingVerdictAnswer", error_detail=detail,
+            )
 
         choice, probabilities, confidence, model_version = answer
         return _signals_from_choice(
@@ -189,6 +200,35 @@ class JevScorer:
             latency_budget_ms=int(self.timeout_seconds * 1000),
             health=health,
         )
+
+
+def describe_typesafe_error(exc: BaseException) -> dict[str, Any]:
+    """Turn SDK / network exceptions into fields safe to show in audit UI."""
+    name = type(exc).__name__
+    detail = str(exc).strip() or name
+    status: int | None = getattr(exc, "status", None)
+    request_id: str | None = getattr(exc, "request_id", None)
+    # Hint common failure modes without dumping secrets.
+    if name in {"TypeSafeAuthenticationError"} or status == 401:
+        detail = f"{detail} — check TYPESAFE_API_KEY is valid for this environment"
+    elif name in {"TypeSafeAPITimeoutError"}:
+        detail = f"{detail} — increase JEV_TIMEOUT_SECONDS or reduce specialist state size"
+    elif name in {"TypeSafeAPIConnectionError"}:
+        detail = f"{detail} — proxy cannot reach api.typesafe.ai (DNS/egress/TLS)"
+    elif name in {"TypeSafeUnprocessableEntityError"} or status == 422:
+        detail = f"{detail} — request body rejected by TypeSafe (state/questions validation)"
+    elif name in {"TypeSafeRateLimitError"} or status == 429:
+        detail = f"{detail} — TypeSafe rate limit; retry later"
+    elif name in {"TypeSafeAPIResponseValidationError"}:
+        field = getattr(exc, "field_path", None)
+        if field:
+            detail = f"{detail} (field={field})"
+    return {
+        "error": name,
+        "error_detail": detail[:800],
+        "error_status": status,
+        "error_request_id": request_id,
+    }
 
 
 def _extract_choice(response: Any, key: str) -> tuple[str, dict[str, float], float, str | None] | None:

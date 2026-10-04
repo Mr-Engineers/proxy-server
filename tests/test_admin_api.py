@@ -142,17 +142,19 @@ def test_agents_crud_and_keys(client) -> None:
 
 def test_rules_crud_meta_dry_run(client) -> None:
     base = "/api/v1/agents/purchasing-agent/rules"
+    before = client.get(base).json()["items"]
     rule = client.post(base, json={
         "name": "Big orders", "tool": "marketplace.place_order",
         "when": {"id": "g", "combinator": "and", "children": [{"id": "l", "field": "quantity", "op": "gt", "value": 100}]},
         "then": "needs_ai",
     }).json()
-    assert rule["then"] == "needs_ai" and rule["position"] == 0
+    assert rule["then"] == "needs_ai"
+    assert rule["position"] == len(before)  # appended after seed demo rules
     assert client.post(base, json={"name": "x", "tool": "t", "when": {"field": "a", "op": "bad"}, "then": "deny"}).status_code == 400
 
     updated = client.put(f"{base}/{rule['id']}", json={**rule, "then": "deny"}).json()
     assert updated["then"] == "deny"
-    assert [item["id"] for item in client.get(base).json()["items"]] == [rule["id"]]
+    assert rule["id"] in {item["id"] for item in client.get(base).json()["items"]}
 
     run = client.post(f"{base}/dry-run", json={"tool": "marketplace.place_order", "args": {"quantity": 400}}).json()
     assert run["matchedRuleId"] == rule["id"] and run["outcome"] == "deny"

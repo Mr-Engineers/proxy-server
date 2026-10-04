@@ -159,13 +159,33 @@ def test_aggregator_v0() -> None:
     assert aggregate("read", policy("allow"), none, False, False, True).verdict is Verdict.ALLOW
     ruled = aggregate("write", policy("allow"), none, False, True, True)
     assert ruled.verdict is Verdict.ALLOW and ruled.specialist_detail == "Rule short-circuit"
-    failed = MlSignals(failed=True, specialist="jev", version="jev-latest")
+    failed = MlSignals(
+        failed=True, specialist="jev", version="jev-latest",
+        error="TypeSafeAuthenticationError", error_detail="401 invalid api key — check TYPESAFE_API_KEY",
+        error_status=401,
+    )
     failed_agg = aggregate("write", policy("allow"), failed, True, False, True)
     assert failed_agg.verdict is Verdict.ESCALATE
-    assert "specialist.failed" in {r.code for r in failed_agg.reasons}
+    reason = next(r for r in failed_agg.reasons if r.code == "specialist.failed")
+    assert "401" in reason.message and "TYPESAFE_API_KEY" in reason.message
+    assert "invalid api key" in failed_agg.specialist_detail
     assert failed_agg.allow_prob is None and failed_agg.deny_prob is None
     skipped = aggregate("write", policy("allow"), none, True, False, True)
     assert skipped.allow_prob is None and skipped.deny_prob is None
+
+
+def test_describe_typesafe_error_hints() -> None:
+    from typesafe_sdk import TypeSafeAPITimeoutError, TypeSafeAuthenticationError
+    from app.pipeline.jev import describe_typesafe_error
+
+    auth = describe_typesafe_error(TypeSafeAuthenticationError(401, {"message": "bad key"}, {}))
+    assert auth["error"] == "TypeSafeAuthenticationError"
+    assert auth["error_status"] == 401
+    assert "TYPESAFE_API_KEY" in auth["error_detail"]
+
+    timeout = describe_typesafe_error(TypeSafeAPITimeoutError(10.0))
+    assert timeout["error"] == "TypeSafeAPITimeoutError"
+    assert "JEV_TIMEOUT_SECONDS" in timeout["error_detail"]
 
 
 def test_aggregator_with_ml_signals() -> None:

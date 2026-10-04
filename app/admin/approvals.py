@@ -50,6 +50,10 @@ def model_choice_label(signals: dict[str, Any], chain: list[dict] | None) -> str
         return "deny → block"
     if choice == "caution":
         return "caution → human"
+    if signals.get("failed"):
+        detail = signals.get("error_detail") or signals.get("error")
+        if detail:
+            return f"specialist failed: {str(detail)[:160]}"
     for step in chain or []:
         if step.get("stage") == "specialist" and step.get("detail"):
             return str(step["detail"])
